@@ -1,5 +1,5 @@
 use crate::runtime::{
-    cons, defun, make_exception, make_list, make_string,
+    cons, define, defun, make_exception, make_list, make_string,
     value::{Null, Value, ValueType},
     SchemeThread,
 };
@@ -393,6 +393,22 @@ fn init_core(thread: &mut SchemeThread) {
     );
     defun(
         thread,
+        "eq?",
+        |_, args| {
+            let first = args[0];
+            for arg in args.iter().skip(1) {
+                if !Value::same_value(*arg, first) {
+                    return Ok(Value::new(false));
+                }
+            }
+            Ok(Value::new(true))
+        },
+        1,
+        true,
+        false,
+    );
+    defun(
+        thread,
         "gc",
         |thread, _| {
             thread.mutator.collect(&mut []);
@@ -402,4 +418,5 @@ fn init_core(thread: &mut SchemeThread) {
         false,
         false,
     );
+    define(thread, "nil", Value::encode_null_value(), false);
 }

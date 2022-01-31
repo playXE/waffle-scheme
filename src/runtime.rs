@@ -1,6 +1,6 @@
 use self::{
     value::{
-        NativeCallback, NativeFunction, Null, Rope, RopeData, ScmBlob, ScmBox, ScmCons,
+        Macro, NativeCallback, NativeFunction, Null, Rope, RopeData, ScmBlob, ScmBox, ScmCons,
         ScmException, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
     },
     vm::Frame,
@@ -516,6 +516,14 @@ pub fn defun(
     qualified_name.value = Value::new(fun);
     qualified_name.mutable = mutable;
 }
+pub fn define(thread: &mut SchemeThread, name: &str, value: Value, mutable: bool) {
+    let name = make_symbol(thread, name);
+    let core = thread.runtime.inner().core_module;
+    env_define(thread, core.unwrap(), Value::new(name), value, true);
+    let mut qualified_name = env_qualify_name(thread, core.unwrap(), Value::new(name));
+    qualified_name.value = value;
+    qualified_name.mutable = mutable;
+}
 
 pub fn string_cat(
     thread: &mut SchemeThread,
@@ -865,9 +873,34 @@ impl std::fmt::Display for Value {
             write!(f, "#<object at {:p}>", self.get_object())
         } else if self.is_native_value() {
             write!(f, "#<native value {}>", self.get_native_value())
+        } else if self.is_object() && self.get_object().is::<Macro>() {
+            write!(f, "#<macro>")
         } else {
             write!(f, "#unknown")
         }
+    }
+}
+
+pub fn value_to_lexpr(thread: &mut SchemeThread, val: Value) -> lexpr::Value {
+    if val.is_int32() {
+        lexpr::Value::Number(lexpr::Number::from(val.get_int32()))
+    } else if val.is_double() {
+        lexpr::Value::Number(lexpr::Number::from_f64(val.get_double()).unwrap())
+    } else if val.boolp() {
+        lexpr::Value::Bool(val.get_bool())
+    } else if val.is_null() {
+        lexpr::Value::Null
+    } else if val.stringp() {
+        lexpr::Value::String(val.string().to_string().into_boxed_str())
+    } else if val.symbolp() {
+        lexpr::Value::Symbol(val.symbol_name().to_string().into_boxed_str())
+    } else if val.consp() {
+        lexpr::Value::Cons(lexpr::Cons::new(
+            value_to_lexpr(thread, val.car()),
+            value_to_lexpr(thread, val.cdr()),
+        ))
+    } else {
+        todo!()
     }
 }
 

@@ -4,7 +4,7 @@ use crate::{Heap, *};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
 use comet_extra::alloc::{array::Array, hash::HashMap, vector::Vector};
 
-use super::SchemeThread;
+use super::{make_exception, make_string, SchemeThread};
 
 pub type TagKind = u32;
 
@@ -646,6 +646,19 @@ pub struct NativeFunction {
     pub(crate) arguments: usize,
     pub(crate) variable_arity: bool,
 }
+
+pub struct Macro {
+    pub(crate) p: Value,
+}
+unsafe impl Trace for Macro {
+    fn trace(&mut self, _vis: &mut dyn Visitor) {
+        self.p.trace(_vis);
+    }
+}
+
+unsafe impl Finalize for Macro {}
+impl Collectable for Macro {}
+
 unsafe impl Trace for NativeFunction {}
 unsafe impl Finalize for NativeFunction {}
 impl Collectable for NativeFunction {}
@@ -725,6 +738,29 @@ unsafe impl Finalize for ScmCons {}
 impl Collectable for ScmCons {}
 
 impl Value {
+    pub fn to_vec(self, thread: &mut SchemeThread) -> Result<Vec<Value>, Value> {
+        let mut res = vec![];
+        let mut el = self;
+        while !el.is_null() {
+            if !el.consp() {
+                let tag = thread.runtime.global_symbol(runtime::Global::ScmEval);
+                let msg = make_string(
+                    thread,
+                    "Only null terminated lists of cons cells can be converted to vec",
+                );
+                return Err(Value::new(make_exception(
+                    thread,
+                    tag,
+                    msg,
+                    Value::new(Null),
+                )));
+            }
+            let cons = el.cons();
+            res.push(cons.car);
+            el = cons.cdr;
+        }
+        Ok(res)
+    }
     pub fn to_boolean(self) -> bool {
         if self.boolp() {
             self.get_bool()

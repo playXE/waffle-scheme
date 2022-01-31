@@ -6,7 +6,8 @@ use crate::{
         convert_module_name, env_define, env_globalp, env_qualify_name, lexpr_to_value,
         load_module, make_blob, make_exception, make_string, make_symbol, make_table, make_vector,
         module_loaded, register_module_,
-        value::{Null, ScmPrototype, ScmString, ScmTable, Undefined, Value},
+        value::{Macro, Null, ScmPrototype, ScmString, ScmTable, Undefined, Value},
+        vm::apply,
         SchemeThread,
     },
     Heap, Managed,
@@ -96,6 +97,7 @@ impl Compiler {
         self.locals = 0;
         self.closure = false;
         self.name = None;
+        self.constants.clear();
     }
     pub fn new(
         thread: &mut SchemeThread,
@@ -227,6 +229,35 @@ impl Compiler {
                             self.push_constant(thread, val);
                             return Ok(());
                         }
+                        "`" => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol("quasiquote".to_string().into_boxed_str()),
+                                cons.cdr().clone(),
+                            ));
+
+                            self.compile(thread, &value, tail)?;
+                            return Ok(());
+                        }
+                        ",@" => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol(
+                                    "unquote-splicing".to_string().into_boxed_str(),
+                                ),
+                                cons.cdr().clone(),
+                            ));
+
+                            self.compile(thread, &value, tail)?;
+                            return Ok(());
+                        }
+                        "," => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol("unquote".to_string().into_boxed_str()),
+                                cons.cdr().clone(),
+                            ));
+
+                            self.compile(thread, &value, tail)?;
+                            return Ok(());
+                        }
                         "import" => {
                             self.import(thread, cons.cdr())?;
                             return Ok(());
@@ -239,16 +270,160 @@ impl Compiler {
                             self.compile_if(thread, cons.cdr(), tail)?;
                             return Ok(());
                         }
-                        _ => (),
+                        "begin" => {
+                            self.compile_begin(thread, cons.cdr(), tail)?;
+                            return Ok(());
+                        }
+                        "defmacro" => {
+                            let name = cons.cdr().as_cons().unwrap().car();
+                            let name = if let lexpr::Value::Symbol(x) = name {
+                                make_symbol(thread, x)
+                            } else {
+                                return Err(self.syntax_error(
+                                    thread,
+                                    &format!("expected symbol in defmacro but found {:?}", name),
+                                ));
+                            };
+                            let body = cons.cdr().as_cons().unwrap().cdr();
+                            self.compile_macro(thread, Value::new(name), body)?;
+                            self.push_constant(thread, Value::new(Null));
+                            return Ok(());
+                        }
+                        x => {
+                            let sym = make_symbol(thread, x);
+                            let x = env_lookup(thread, self.env, Value::new(sym), false);
+                            if let Some(Lookup::Global { value, .. }) = x {
+                                if value.is_object() && value.get_object().is::<Macro>() {
+                                    let expanded =
+                                        self.macro_expand_full(thread, value, cons.cdr())?;
+                                    self.compile(thread, &expanded, tail)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
                     },
                     _ => (),
                 }
 
                 self.compile_apply(thread, exp, tail)?;
             }
-
+            lexpr::Value::Null => {
+                self.emit(Op::PushNull);
+                self.push(1);
+            }
             _ => todo!("{:?}", exp),
         }
+        Ok(())
+    }
+    pub fn compile_begin(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        tail: bool,
+    ) -> Result<(), Value> {
+        if exp.is_null() {
+            self.push_constant(thread, Value::new(Null));
+            return Ok(());
+        }
+
+        match exp.as_cons() {
+            Some(cons) => {
+                if cons.cdr().is_null() {
+                    self.compile(thread, cons.car(), tail)?;
+                    Ok(())
+                } else {
+                    self.compile(thread, cons.car(), false)?;
+                    self.compile_begin(thread, cons.cdr(), tail)
+                }
+            }
+            None => Err(self.syntax_error(
+                thread,
+                &format!(
+                    "Unexpected value passed to begin block instead of a cons: {}",
+                    exp
+                ),
+            )),
+        }
+    }
+    pub fn macro_expand_1_step(
+        &mut self,
+        thread: &mut SchemeThread,
+        p: Value,
+        exp: &lexpr::Value,
+    ) -> Result<Value, Value> {
+        let exp = lexpr_to_value(thread, exp).to_vec(thread)?;
+        let p = p.downcast::<Macro>();
+        apply(thread, Value::new(p.p), &exp)
+    }
+
+    pub fn macro_expand_full(
+        &mut self,
+        thread: &mut SchemeThread,
+        p: Value,
+        exp: &lexpr::Value,
+    ) -> Result<lexpr::Value, Value> {
+        let expanded = self.macro_expand_1_step(thread, p, exp)?;
+        let mut expanded = crate::runtime::value_to_lexpr(thread, expanded);
+
+        if let Some(cons) = expanded.as_cons_mut() {
+            if !cons.car().is_symbol() {
+                return Ok(expanded);
+            }
+
+            let mut cons = Some(cons);
+            while let Some(c) = cons {
+                let substitute = match c.car().as_cons() {
+                    Some(elt) => {
+                        if elt.car().is_symbol() {
+                            let key = make_symbol(thread, elt.car().as_symbol().unwrap());
+                            if let Some(Lookup::Global { value, .. }) =
+                                env_lookup(thread, self.env, Value::new(key), false)
+                            {
+                                if value.is_object() && value.get_object().is::<Macro>() {
+                                    let substitute =
+                                        self.macro_expand_full(thread, value, elt.cdr())?;
+                                    Some(substitute)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(substitute) = substitute {
+                    *c.car_mut() = substitute;
+                }
+                cons = c.cdr_mut().as_cons_mut();
+            }
+        }
+        Ok(expanded)
+    }
+
+    pub fn compile_macro(
+        &mut self,
+        thread: &mut SchemeThread,
+        name: Value,
+        lambda: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let exporting = self.exporting(thread);
+        let mut closure = false;
+        let proto = self.compile_lambda_no_push(thread, lambda, name, &mut closure)?;
+
+        let proto = thread
+            .mutator
+            .allocate(Macro { p: proto }, comet::gc_base::AllocationSpace::New);
+        env_define(
+            thread,
+            self.env,
+            Value::new(name),
+            Value::new(proto),
+            exporting,
+        );
         Ok(())
     }
     pub fn compile_export(
@@ -404,6 +579,17 @@ impl Compiler {
         }
         Ok(())
     }
+    pub fn compile_lambda_no_push(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        name: Value,
+        closure: &mut bool,
+    ) -> Result<Value, Value> {
+        let proto = self.generate_lambda(thread, 0, exp, false, name, closure)?;
+
+        Ok(proto)
+    }
     pub fn compile_ref(&mut self, thread: &mut SchemeThread, exp: &Box<str>) -> Result<(), Value> {
         let name = make_symbol(thread, exp);
         let name = Value::new(name);
@@ -479,7 +665,7 @@ impl Compiler {
                 format!("lambda expects () or symbol, got '{:?}'", args),
             ));
         }
-        self.dump("compiling subfunction");
+        self.dump(&format!("compiling subfunction {}", name));
         let stack = thread.mutator.shadow_stack();
         letroot!(
             cc = stack,
@@ -491,11 +677,7 @@ impl Compiler {
             cc.name = Some(name.symbol_name());
         }
 
-        cc.compile(
-            thread,
-            rest.as_cons().unwrap().cdr().as_cons().unwrap().car(),
-            true,
-        )?;
+        cc.compile_begin(thread, rest.as_cons().unwrap().cdr(), true)?;
 
         let proto = cc.end(thread, argc as _, variable_arity);
         *closure = cc.closure;
@@ -575,7 +757,11 @@ impl Compiler {
 
             let mut lookup_copy = *lookup;
             match &mut lookup_copy {
-                Lookup::Local { level, .. } => *level -= 1,
+                Lookup::Local { level, .. } => {
+                    if *level != 0 {
+                        *level -= 1
+                    }
+                }
                 _ => unreachable!(),
             }
             if l.lexical_level != 0 {
@@ -701,6 +887,8 @@ impl Compiler {
         let i = self.constants.len();
         self.constants.push(&mut thread.mutator, constant);
         self.emit(Op::PushConstant(i as _));
+
+        //assert!(i < self.constants.len());
         self.dump(&format!("push-constant {} : {}", i, constant));
     }
 
@@ -760,6 +948,7 @@ impl Compiler {
         }
         let debuginfo = make_blob::<u8>(thread, 0);
         let constants = std::mem::replace(&mut self.constants, Vector::new(&mut thread.mutator));
+
         thread.mutator.allocate(
             ScmPrototype {
                 constants: constants,

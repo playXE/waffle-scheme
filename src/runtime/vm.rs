@@ -162,6 +162,8 @@ pub fn vm_apply(
                 };
             }
             if args.len() < prototype.arguments as usize {
+                println!("{}", Value::new(prototype));
+
                 vm_ret!(Err(arity_error_least(
                     thread,
                     prototype.arguments as _,
@@ -236,6 +238,7 @@ pub fn vm_apply(
                     Op::LocalSet(x) => {
                         let v = f.stack.add(f.si - 1).read();
                         f.si -= 1;
+
                         f.locals.add(x as _).write(v);
                     }
                     Op::LocalGet(x) => {
@@ -377,6 +380,7 @@ pub fn apply(
             }
             return (native.callback)(thread, &args);
         }
+
         let (prototype, closure) = if function.prototypep() {
             (function.downcast::<ScmPrototype>(), None)
         } else {

@@ -125,7 +125,6 @@ dependencies = [
 [[package]]
 name = "comet"
 version = "0.1.0"
-source = "git+https://github.com/starlight-js/comet#2734101a96b1f05ccd8c4af3fc06e482ace91d2b"
 dependencies = [
  "ahash",
  "atomic",
@@ -148,7 +147,6 @@ dependencies = [
 [[package]]
 name = "comet-extra"
 version = "0.1.0"
-source = "git+https://github.com/starlight-js/comet#2734101a96b1f05ccd8c4af3fc06e482ace91d2b"
 dependencies = [
  "ahash",
  "cfg-if",
