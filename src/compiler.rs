@@ -223,7 +223,7 @@ impl Compiler {
                             return Ok(());
                         }
                         "quote" | "'" => {
-                            let val = lexpr_to_value(thread, cons.cdr());
+                            let val = lexpr_to_value(thread, cons.cdr().as_cons().unwrap().car());
                             self.push_constant(thread, val);
                             return Ok(());
                         }
