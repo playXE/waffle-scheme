@@ -1,0 +1,22 @@
+[package]
+name = "waffle"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+comet = { git = "https://github.com/starlight-js/comet" }
+comet-extra = { git = "https://github.com/starlight-js/comet" }
+lexpr = "0.2"
+alloca = "*"
+dashmap = "5.0"
+parking_lot = "0.12"
+rustyline = "9.1"
+structopt = "0.3"
+[features]
+minimark = []
+immix = []
+semispace = []
+marksweep = []
+default = ["immix"]
