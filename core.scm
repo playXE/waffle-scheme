@@ -111,4 +111,26 @@
 		    (while ,predicate ,@body (set! ,varname ,step-value)))))
 
 
-(export append cadr cdar caar cddr caddr transfer map vector-empty?)
+(defun foreach (proc list)
+    (defun helper (c)
+        (if (list? c)
+            (begin 
+                (proc (car c))
+                (helper (cdr c))
+            )
+            '()
+        )
+    )
+    (helper list)
+)
+
+(defun parallel thunks 
+    (let ((handles (vector) ))
+        (begin 
+            (foreach 
+                (lambda (thunk) 
+                    (vector-push handles (thread/spawn thunk)))
+                thunks)
+            (vector-map thread/join handles))))
+
+(export append cadr cdar caar cddr caddr transfer map vector-empty? parallel)

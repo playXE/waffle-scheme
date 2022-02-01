@@ -590,7 +590,7 @@ pub struct ScmPrototype {
     pub(crate) upvalues: ScmBlob,
     pub(crate) name: Option<Managed<ScmString>>,
     pub(crate) stack_max: u16,
-    pub(crate) locals: u16,
+    pub locals: u16,
     pub(crate) local_free_variable_count: u16,
     pub(crate) arguments: u16,
     pub(crate) variable_arity: bool,

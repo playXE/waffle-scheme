@@ -19,10 +19,12 @@ use super::{
     Global, SchemeThread,
 };
 
+#[repr(C)]
 pub struct Frame {
     pub prev: *mut Frame,
     pub p: Managed<ScmPrototype>,
     pub c: Option<Managed<Closure>>,
+
     pub stack: *mut Value,
     pub locals: *mut Value,
     pub upvalues: *mut Value,
@@ -61,6 +63,7 @@ impl Frame {
             p,
             c,
             stack,
+
             locals,
             upvalues: null_mut(),
             si: 0,
@@ -164,8 +167,6 @@ pub fn vm_apply(
             if args.len() < prototype.arguments as usize
                 && (!prototype.variable_arity && args.len() != prototype.arguments as usize - 1)
             {
-                println!("{}", Value::new(prototype));
-
                 vm_ret!(Err(arity_error_least(
                     thread,
                     prototype.arguments as _,
@@ -248,9 +249,6 @@ pub fn vm_apply(
                         f.si += 1;
                     }
                     Op::UpvalueGet(x) => {
-                        if x as usize >= closure.unwrap_unchecked().upvalues.len() {
-                            panic!("wtf {} {}", Value::new(prototype), x);
-                        }
                         f.stack
                             .add(f.si)
                             .write(closure.unwrap_unchecked().upvalues[x as usize].upvalue());
@@ -283,7 +281,6 @@ pub fn vm_apply(
                                 c.upvalues
                                     .push(&mut thread.mutator, f.upvalues.add(l.index as _).read());
                             } else {
-                                println!("{}", Value::new(closure.unwrap().prototype));
                                 c.upvalues.push(
                                     &mut thread.mutator,
                                     closure.unwrap_unchecked().upvalues[l.index as usize],

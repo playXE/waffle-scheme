@@ -1,8 +1,7 @@
 use self::{
     value::{
-        Macro, NativeCallback, NativeFunction, Null, Rope, RopeData, ScmBignum, ScmBlob, ScmBox,
-        ScmComplex, ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector,
-        Value,
+        Macro, NativeCallback, NativeFunction, Null, ScmBignum, ScmBlob, ScmBox, ScmComplex,
+        ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
     },
     vm::Frame,
 };
@@ -28,20 +27,24 @@ use std::{
 };
 
 pub mod arith;
+pub mod interpreter;
 pub mod subr_arith;
+pub mod threading;
 pub mod value;
 pub mod vm;
+#[repr(C)]
 pub struct SchemeThread {
+    pub(crate) current_frame: *mut Frame,
     pub mutator: MutatorRef<Heap>,
     pub runtime: Runtime,
     pub(crate) trampoline_arguments: Vec<Value>,
     pub(crate) trampoline_fn: Value,
-    pub(crate) current_frame: *mut Frame,
+
     pub(crate) rc: u32,
 }
 
 pub struct SchemeThreadRef {
-    ptr: NonNull<SchemeThread>,
+    pub(crate) ptr: NonNull<SchemeThread>,
 }
 
 impl SchemeThreadRef {}
@@ -61,12 +64,11 @@ impl DerefMut for SchemeThreadRef {
 
 impl Drop for SchemeThreadRef {
     fn drop(&mut self) {
-        if self.rc == 1 {
+        self.rc -= 1;
+        if self.rc == 0 {
             unsafe {
                 std::ptr::drop_in_place(self.ptr.as_ptr());
             }
-        } else {
-            self.rc -= 1;
         }
     }
 }
@@ -111,6 +113,8 @@ pub(crate) struct RtInner {
 pub struct Runtime {
     inner: NonNull<RtInner>,
 }
+
+unsafe impl Send for Runtime {}
 
 impl Runtime {
     pub fn with_modules<R>(&self, mut cb: impl FnMut(&mut Managed<ScmTable>) -> R) -> R {

@@ -1121,28 +1121,28 @@ pub fn env_lookup(
                     up,
                 });
             }
-        } else if env_globalp(thread, env) {
-            let rt = thread.runtime;
-            for module in rt.inner().qualified_imports.iter() {
-                let module = module.table();
+        } /*else if env_globalp(thread, env) {
+              let rt = thread.runtime;
+              for module in rt.inner().qualified_imports.iter() {
+                  let module = module.table();
 
-                let exports = thread
-                    .runtime
-                    .global_symbol(crate::runtime::Global::Exports);
-                if let Some(exports) = module.get(Value::new(exports)) {
-                    if exports.tablep() {
-                        let table = exports.table();
+                  let exports = thread
+                      .runtime
+                      .global_symbol(crate::runtime::Global::Exports);
+                  if let Some(exports) = module.get(Value::new(exports)) {
+                      if exports.tablep() {
+                          let table = exports.table();
 
-                        if let Some(val) = table.get(Value::new(key)) {
-                            return Some(Lookup::Global {
-                                value: val,
-                                module: Value::new(module),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+                          if let Some(val) = table.get(Value::new(key)) {
+                              return Some(Lookup::Global {
+                                  value: val,
+                                  module: Value::new(module),
+                              });
+                          }
+                      }
+                  }
+              }
+          }*/
         level += 1;
 
         let parent = thread.runtime.global_symbol(crate::runtime::Global::Parent);

@@ -13,12 +13,10 @@ comet-extra = { path = "comet/crates/comet-extra" }
 lexpr = "0.2"
 alloca = "*"
 num = "0.4"
-dashmap = "5.0"
-inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = [
-    "llvm12-0",
-] }
-radix_fmt = "1.0"
 parking_lot = "0.12"
+cranelift = "0.80"
+cranelift-jit = "0.80"
+cranelift-module = "0.80"
 memoffset = "0.6"
 rustyline = "9.1"
 structopt = "0.3"

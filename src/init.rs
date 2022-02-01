@@ -1,6 +1,6 @@
 use crate::runtime::{
-    cons, define, defun, make_exception, make_list, make_string, make_vector,
-    value::{Null, ScmSymbol, ScmVector, Value, ValueType},
+    cons, define, defun, make_box, make_exception, make_list, make_string, make_vector,
+    value::{Null, ScmBox, ScmSymbol, ScmVector, Value},
     SchemeThread,
 };
 use std::sync::atomic::AtomicU64;
@@ -50,6 +50,7 @@ pub fn wrong_type_argument(
 
 fn init_core(thread: &mut SchemeThread) {
     crate::runtime::subr_arith::init(thread);
+    crate::runtime::threading::init(thread);
     defun(
         thread,
         "car",
@@ -353,7 +354,7 @@ fn init_core(thread: &mut SchemeThread) {
         "vector-length",
         |thread, args| {
             let arg = args[0];
-            println!("{}", arg);
+
             if !arg.vectorp() {
                 return Err(wrong_type_argument(
                     thread,
@@ -543,13 +544,7 @@ fn init_core(thread: &mut SchemeThread) {
         |thread, args| {
             let vec = args[0];
             if !vec.vectorp() {
-                return Err(wrong_type_argument(
-                    thread,
-                    "vector-fill!",
-                    "vector",
-                    vec,
-                    1,
-                ));
+                return Err(wrong_type_argument(thread, "vector-push", "vector", vec, 1));
             }
             if args.len() > 1 {
                 for arg in &args[1..] {
@@ -700,6 +695,78 @@ fn init_core(thread: &mut SchemeThread) {
             ))
         },
         0,
+        false,
+        false,
+    );
+
+    defun(
+        thread,
+        "box?",
+        |_, args| Ok(Value::new(args[0].is_cell::<ScmBox>())),
+        1,
+        false,
+        false,
+    );
+
+    defun(
+        thread,
+        "box",
+        |thread, args| Ok(Value::new(make_box(thread, args[0]))),
+        1,
+        false,
+        false,
+    );
+    defun(
+        thread,
+        "unbox",
+        |thread, args| {
+            if !args[0].is_cell::<ScmBox>() {
+                return Err(wrong_type_argument(thread, "unbox", "box", args[0], 1));
+            }
+            Ok(args[0].downcast::<ScmBox>().value)
+        },
+        1,
+        false,
+        false,
+    );
+
+    defun(
+        thread,
+        "set-box!",
+        |thread, args| {
+            if !args[0].is_cell::<ScmBox>() {
+                return Err(wrong_type_argument(thread, "set-box!", "box", args[0], 1));
+            }
+            args[0].downcast::<ScmBox>().value = args[1];
+            Ok(Value::new(Null))
+        },
+        2,
+        false,
+        false,
+    );
+
+    defun(
+        thread,
+        "box-cas!",
+        |thread, args| {
+            if !args[0].is_cell::<ScmBox>() {
+                return Err(wrong_type_argument(thread, "box-cas!", "box", args[0], 1));
+            }
+            let slot = unsafe {
+                std::mem::transmute::<_, &AtomicU64>(&args[0].downcast::<ScmBox>().value)
+            };
+
+            Ok(Value::new(
+                slot.compare_exchange(
+                    args[1].get_raw(),
+                    args[2].get_raw(),
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok(),
+            ))
+        },
+        3,
         false,
         false,
     );
