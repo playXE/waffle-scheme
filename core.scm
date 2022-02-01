@@ -10,7 +10,8 @@
 (defun caar (x) (car (car x)))
 (defun cddr (x) (cdr (cdr x)))
 (defun cadar (x) (car (cdr (car x))))
-
+(defun caddr (x) (car (cdr (cdr x))))
+(defun cdddr (x) (cdr (cdr (cdr x))))
 (defun transfer (ls)
     (if (pair? ls)
         (if (pair? (car ls))
@@ -41,4 +42,73 @@
 	`(let ,(map (lambda (v) (list (car v) nil)) bindings)
 		,@(map (lambda (v) `(set! ,@v)) bindings)
 		,@body))
-(export append cadr cdar caar cddr transfer map)
+
+(defun range (start end step proc) 
+    (defun helper (n)   
+        (if (eq? n end)
+            '()
+            (begin 
+                (proc n)
+                (helper (+ n step))
+            )
+        )
+    )
+    (helper start)
+)
+(defun vector-empty? (v) (eq? (vector-length v) 0))
+(defun vector-foreach (proc v) 
+    (range 0 (vector-length v) 1 
+        (lambda (i) 
+            (proc (vector-ref v i))))
+)
+
+(defun vector-map (proc v)
+    (let ((nv (vector)))
+      (begin (vector-foreach 
+            (lambda (elem)
+                (vector-push nv (proc elem))
+            ) v)
+        nv
+      )
+    )
+)
+
+(defun vector-map! (proc v) 
+    (range 0 (vector-length v) 1 
+        (lambda (i) 
+            (vector-set! v i (proc (vector-ref v i)))
+        )
+    )
+    v
+)
+(defmacro cond (first . rest)
+	(if (null? rest)
+		`(begin ,first)
+		`(if ,(car first) 
+			(begin ,@(cdr first))
+			(cond ,@rest))))
+			
+
+(defmacro while (condition . body)
+ (let ((loop (gensym)))
+    `(letrec ((,loop (lambda () 
+        (if ,condition
+            (begin 
+                ,@body 
+                (,loop)
+            )
+            '()
+    )))) (,loop))
+ )
+)
+
+(defmacro for (test . body)
+    (let ((varname (car test)) 
+	      (init-value (cadr test)) 
+		  (predicate (caddr test)) 
+		  (step-value (car (cdddr test))))
+	    `(let ((,varname ,init-value)) 
+		    (while ,predicate ,@body (set! ,varname ,step-value)))))
+
+
+(export append cadr cdar caar cddr caddr transfer map vector-empty?)

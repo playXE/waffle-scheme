@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use comet::{api::Trace, letroot};
 use comet_extra::alloc::vector::Vector;
 
@@ -37,7 +39,7 @@ pub enum Op {
 
 unsafe impl Trace for Op {}
 /// A structure describing the location of a free variable relative to the function it's being used in
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FreeVariableInfo {
     /// The lexical location of the variable
     lexical_level: usize,
@@ -46,6 +48,7 @@ pub struct FreeVariableInfo {
     /// preceding function, or in the locals array of the currently executing
     /// function
     index: usize,
+    name: Value,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +62,7 @@ pub struct Compiler {
     parent: Option<*mut Compiler>,
     pub code: Vec<Op>,
     free_variables: Vec<FreeVariableInfo>,
+    free_upvariables: Vec<FreeVariableInfo>,
     local_free_variable_count: usize,
     upvalue_count: usize,
     stack_max: usize,
@@ -90,6 +94,7 @@ impl Compiler {
     pub fn clear(&mut self) {
         self.code.clear();
         self.free_variables.clear();
+        self.free_upvariables.clear();
         self.local_free_variable_count = 0;
         self.upvalue_count = 0;
         self.stack_max = 0;
@@ -107,6 +112,7 @@ impl Compiler {
     ) -> Self {
         let constants = Vector::new(&mut thread.mutator);
         Self {
+            free_upvariables: vec![],
             dump_bytecode: thread.runtime.inner().dump_bytecode,
             parent,
             code: vec![],
@@ -166,6 +172,11 @@ impl Compiler {
         tail: bool,
     ) -> Result<(), Value> {
         match exp {
+            lexpr::Value::Char(x) => {
+                let x = *x as i32;
+                self.emit(Op::PushInt(x));
+                self.push(1);
+            }
             lexpr::Value::Bool(x) => {
                 if !*x {
                     self.emit(Op::PushFalse);
@@ -311,6 +322,10 @@ impl Compiler {
                 self.emit(Op::PushNull);
                 self.push(1);
             }
+            lexpr::Value::String(x) => {
+                let string = make_string(thread, x);
+                self.push_constant(thread, Value::new(string));
+            }
             _ => todo!("{:?}", exp),
         }
         Ok(())
@@ -364,7 +379,7 @@ impl Compiler {
     ) -> Result<lexpr::Value, Value> {
         let expanded = self.macro_expand_1_step(thread, p, exp)?;
         let mut expanded = crate::runtime::value_to_lexpr(thread, expanded);
-
+        println!("{}", expanded);
         if let Some(cons) = expanded.as_cons_mut() {
             if !cons.car().is_symbol() {
                 return Ok(expanded);
@@ -681,7 +696,11 @@ impl Compiler {
 
         let proto = cc.end(thread, argc as _, variable_arity);
         *closure = cc.closure;
-
+        self.dump(&format!(
+            "subfunction compiled {} (upvalues: {})",
+            Value::new(proto),
+            proto.upvalues.len() / size_of::<UpvalLoc>()
+        ));
         Ok(Value::new(proto))
     }
 
@@ -692,7 +711,7 @@ impl Compiler {
         tail: bool,
     ) -> Result<(), Value> {
         let condition = exp.as_cons().unwrap().car();
-        let then_expr = exp.as_cons().unwrap().cdr().as_cons().unwrap().car();
+
         let else_expr = exp
             .as_cons()
             .unwrap()
@@ -713,7 +732,14 @@ impl Compiler {
 
         let old_stack = self.stack_size as usize;
 
-        self.compile(thread, then_expr, tail)?;
+        match exp.as_cons().unwrap().cdr().as_cons() {
+            Some(x) => {
+                self.compile(thread, x.car(), tail)?;
+            }
+            None => {
+                self.compile(thread, exp.as_cons().unwrap().cdr(), tail)?;
+            }
+        }
         self.pop(self.stack_size as usize - old_stack);
         let jmp2 = self.code.len();
         self.emit(Op::Jump(0));
@@ -736,11 +762,12 @@ impl Compiler {
         Ok(())
     }
 
-    pub fn register_free_variable(&mut self, lookup: &Lookup) -> usize {
+    pub fn register_free_variable(&mut self, lookup: &Lookup, name: Value) -> usize {
         let mut l = FreeVariableInfo {
             index: 0,
             lexical_index: 0,
             lexical_level: 0,
+            name,
         };
 
         for i in 0..self.free_variables.len() {
@@ -751,32 +778,40 @@ impl Compiler {
                 }
             }
         }
+
+        for i in 0..self.free_upvariables.len() {
+            l = self.free_upvariables[i];
+            if let Lookup::Local { level, index, .. } = lookup {
+                if *level == l.lexical_level && l.lexical_index == *index {
+                    return i;
+                }
+            }
+        }
+        let mut lookup_copy = *lookup;
+
         if let Lookup::Local { level, index, .. } = lookup {
             l.lexical_level = *level;
             l.lexical_index = *index;
 
-            let mut lookup_copy = *lookup;
-            match &mut lookup_copy {
-                Lookup::Local { level, .. } => {
-                    if *level != 0 {
-                        *level -= 1
-                    }
-                }
-                _ => unreachable!(),
-            }
             if l.lexical_level != 0 {
+                match &mut lookup_copy {
+                    Lookup::Local { level, .. } => *level -= 1,
+                    _ => unreachable!(),
+                }
                 self.closure = true;
                 unsafe {
-                    l.index =
-                        (**self.parent.as_mut().unwrap()).register_free_variable(&lookup_copy);
+                    l.index = (**self.parent.as_mut().unwrap())
+                        .register_free_variable(&lookup_copy, name);
                 }
                 self.upvalue_count += 1;
+                self.free_upvariables.push(l);
+                self.free_upvariables.len() - 1
             } else {
                 l.index = l.lexical_index;
                 self.local_free_variable_count += 1;
+                self.free_variables.push(l);
+                self.free_variables.len() - 1
             }
-            self.free_variables.push(l);
-            self.free_variables.len() - 1
         } else {
             unreachable!()
         }
@@ -835,10 +870,10 @@ impl Compiler {
                     self.push(1);
                     self.dump(&format!("local-get {}", index));
                 } else {
-                    let index = self.register_free_variable(lookup);
+                    let index = self.register_free_variable(lookup, name);
                     self.emit(Op::UpvalueGet(index as _));
                     self.push(1);
-                    self.dump(&format!("upvalue-get {}", index));
+                    self.dump(&format!("upvalue-get {} : {}", index, name));
                 }
                 Ok(())
             }
@@ -854,7 +889,13 @@ impl Compiler {
     ) {
         match lookup {
             Lookup::Global { .. } => {
-                let qualified_name = env_qualify_name(thread, env, name);
+                let p = thread.runtime.global_symbol(crate::runtime::Global::Parent);
+                let mut global = env;
+
+                while !env_globalp(thread, global) {
+                    global = global.get(Value::new(p)).unwrap().table();
+                }
+                let qualified_name = env_qualify_name(thread, global, name);
 
                 self.push_constant(thread, Value::new(qualified_name));
                 self.emit(Op::GlobalSet);
@@ -863,9 +904,9 @@ impl Compiler {
             }
             Lookup::Local { index, up, .. } => {
                 if *up {
-                    let index = self.register_free_variable(lookup);
-                    self.emit(Op::UpvalueGet(index as _));
-                    self.dump(&format!("upvalue-get {}", index));
+                    let index = self.register_free_variable(lookup, name);
+                    self.emit(Op::UpvalueSet(index as _));
+                    self.dump(&format!("upvalue-set {} : {}", index, name));
                 } else {
                     self.emit(Op::LocalSet(*index as _));
                     self.dump(&format!("local-set {}", index));
@@ -936,14 +977,17 @@ impl Compiler {
                     freevar_i += 1;
                 }
             } else {
-                let l = UpvalLoc {
-                    local: self.free_variables[i].lexical_level == 1,
-                    index: self.free_variables[i].index as _,
-                };
-                unsafe {
-                    u.blob_set(upvalue_i, l);
-                    upvalue_i += 1;
-                }
+                unreachable!()
+            }
+        }
+        for i in 0..self.free_upvariables.len() {
+            let l = UpvalLoc {
+                local: self.free_upvariables[i].lexical_level == 1,
+                index: self.free_upvariables[i].index as _,
+            };
+            unsafe {
+                u.blob_set(upvalue_i, l);
+                upvalue_i += 1;
             }
         }
         let debuginfo = make_blob::<u8>(thread, 0);

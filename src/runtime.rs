@@ -1,7 +1,8 @@
 use self::{
     value::{
-        Macro, NativeCallback, NativeFunction, Null, Rope, RopeData, ScmBlob, ScmBox, ScmCons,
-        ScmException, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
+        Macro, NativeCallback, NativeFunction, Null, Rope, RopeData, ScmBignum, ScmBlob, ScmBox,
+        ScmComplex, ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector,
+        Value,
     },
     vm::Frame,
 };
@@ -18,13 +19,16 @@ use comet::{
     mutator::MutatorRef,
 };
 
-use comet_extra::alloc::{array::Array, hash::HashMap, vector::Vector};
+use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 use std::{
     mem::size_of,
     ops::{Deref, DerefMut},
     ptr::{null_mut, NonNull},
     sync::atomic::AtomicU64,
 };
+
+pub mod arith;
+pub mod subr_arith;
 pub mod value;
 pub mod vm;
 pub struct SchemeThread {
@@ -96,7 +100,7 @@ pub(crate) struct RtInner {
     pub(crate) symbol_table: Option<Managed<ScmTable>>,
     pub(crate) modules: Option<Managed<ScmTable>>,
     pub(crate) globals: Vec<Managed<ScmSymbol>>,
-    pub(crate) module_search_paths: Vec<String>,
+    pub(crate) module_search_paths: Vec<std::string::String>,
     pub(crate) qualified_imports: Vec<Value>,
     pub(crate) threads: Vec<SchemeThreadRef>,
     pub(crate) global_lock: Lock,
@@ -215,7 +219,7 @@ impl Runtime {
     }
 }
 
-static ID: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Global {
@@ -489,7 +493,11 @@ pub fn env_qualify_name(
     name: Value,
 ) -> Managed<ScmSymbol> {
     let sym = thread.runtime.global_symbol(Global::ModuleName);
-    let module_name = env.get(Value::new(sym)).unwrap().string();
+
+    let module_name = env
+        .get(Value::new(sym))
+        .unwrap_or_else(|| panic!("wtf {:?} {}", env.keys(), name))
+        .string();
     let name = format!("{}#{}", module_name.to_string(), name);
 
     make_symbol(thread, name)
@@ -530,19 +538,11 @@ pub fn string_cat(
     first: Managed<ScmString>,
     second: Managed<ScmString>,
 ) -> Managed<ScmString> {
-    let s1 = first.rope;
-    let s2 = second.rope;
-    let node = thread.mutator.allocate(
-        Rope {
-            length: s1.length + s2.length,
-            data: RopeData::Node(s1, s2),
-        },
-        AllocationSpace::New,
-    );
-
+    let string = format!("{}{}", first.string, second.string);
+    let str = String::from_str(&mut thread.mutator, string);
     thread
         .mutator
-        .allocate(ScmString { rope: node }, AllocationSpace::New)
+        .allocate(ScmString { string: str }, AllocationSpace::New)
 }
 
 pub fn vector_append(thread: &mut SchemeThread, vec: Value, value: Value) {
@@ -756,7 +756,7 @@ pub fn convert_module_name(
     thread: &mut SchemeThread,
     mut spec: &lexpr::Value,
 ) -> Result<Value, Value> {
-    let mut out = String::new();
+    let mut out = std::string::String::new();
     out.push('#');
     if spec.is_symbol() {
         out.push_str(&spec.to_string());
@@ -794,7 +794,11 @@ pub fn convert_module_name(
     }
     Ok(Value::new(make_string(thread, out)))
 }
-
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_int32() {
@@ -955,4 +959,22 @@ pub fn make_list(thread: &mut SchemeThread, values: &[Value]) -> Value {
     first
         .map(|x| Value::new(x))
         .unwrap_or_else(|| Value::encode_null_value())
+}
+
+pub fn make_bignum(thread: &mut SchemeThread, n: num::BigInt) -> Managed<ScmBignum> {
+    thread
+        .mutator
+        .allocate(ScmBignum { num: n }, AllocationSpace::New)
+}
+
+pub fn make_complex(thread: &mut SchemeThread, n: num::complex::Complex64) -> Managed<ScmComplex> {
+    thread
+        .mutator
+        .allocate(ScmComplex { complex: n }, AllocationSpace::New)
+}
+
+pub fn make_rational(thread: &mut SchemeThread, n: num::BigRational) -> Managed<ScmRational> {
+    thread
+        .mutator
+        .allocate(ScmRational { rational: n }, AllocationSpace::New)
 }

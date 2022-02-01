@@ -2,9 +2,9 @@ use std::{hash::Hash, ptr::NonNull};
 
 use crate::{Heap, *};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
-use comet_extra::alloc::{array::Array, hash::HashMap, vector::Vector};
+use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 
-use super::{make_exception, make_string, SchemeThread};
+use super::{make_exception, make_string, make_vector, SchemeThread};
 
 pub type TagKind = u32;
 
@@ -285,13 +285,8 @@ impl Value {
             && rhs.get_object().is::<ScmString>()
         {
             return unsafe {
-                lhs.get_object()
-                    .downcast_unchecked::<ScmString>()
-                    .to_string()
-                    == rhs
-                        .get_object()
-                        .downcast_unchecked::<ScmString>()
-                        .to_string()
+                lhs.get_object().downcast_unchecked::<ScmString>().string
+                    == rhs.get_object().downcast_unchecked::<ScmString>().string
             };
         }
 
@@ -414,7 +409,7 @@ mod tests {
 }
 
 pub struct ScmString {
-    pub(crate) rope: Managed<Rope>,
+    pub(crate) string: String<Heap>,
 }
 
 #[repr(C)]
@@ -455,7 +450,7 @@ impl Collectable for Rope {}
 impl ScmString {
     pub fn new(mutator: &mut MutatorRef<Heap>, str: impl AsRef<str>) -> Value {
         let str = str.as_ref();
-        // we do not root leaf because it is instantly passed to `Str` so if GC will happen,
+        /*// we do not root leaf because it is instantly passed to `Str` so if GC will happen,
         // leaf will be traced too.
         let string = comet_extra::alloc::string::Str::new(mutator, str);
         let leaf = mutator.allocate(
@@ -468,33 +463,25 @@ impl ScmString {
         unsafe {
             std::ptr::copy_nonoverlapping(str.as_ptr(), leaf.data.leaf().as_mut_ptr(), str.len());
         }
-
-        Value::encode_object_value(mutator.allocate(ScmString { rope: leaf }, AllocationSpace::New))
+        */
+        let str = String::from_str(mutator, str);
+        Value::encode_object_value(
+            mutator.allocate(ScmString { string: str }, AllocationSpace::New),
+        )
     }
-    pub fn to_string(&self) -> String {
-        let mut buf = String::new();
-        self.to_string_internal(self.rope, &mut buf);
-        buf
+    pub fn to_string(&self) -> std::string::String {
+        self.string.as_str().to_string()
     }
 
     pub fn len(&self) -> usize {
-        self.rope.length
-    }
-
-    fn to_string_internal(&self, rope: Managed<Rope>, str: &mut String) {
-        if let RopeData::Leaf(string) = &rope.data {
-            str.push_str(&*string);
-        } else if let RopeData::Node(s1, s2) = &rope.data {
-            self.to_string_internal(*s1, str);
-            self.to_string_internal(*s2, str);
-        }
+        self.string.len()
     }
 }
 impl Collectable for ScmString {}
 
 unsafe impl Trace for ScmString {
     fn trace(&mut self, vis: &mut dyn Visitor) {
-        self.rope.trace(vis);
+        self.string.trace(vis);
     }
 }
 
@@ -510,7 +497,7 @@ impl Hash for HashValueZero {
         } else if !self.0.is_empty() {
             let obj = self.0.get_object();
             if let Some(string) = obj.downcast::<ScmString>() {
-                string.to_string().hash(state);
+                string.string.hash(state);
             } else if let Some(symbol) = obj.downcast::<ScmSymbol>() {
                 symbol.id.hash(state);
             } else {
@@ -560,7 +547,7 @@ impl ScmTable {
         self.get(key).is_some()
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    pub fn keys(&self) -> Vec<std::string::String> {
         let mut keys = vec![];
         for (key, val) in self.table.iter() {
             keys.push(format!("{}->{}", key.0, val));
@@ -760,6 +747,29 @@ impl Value {
             el = cons.cdr;
         }
         Ok(res)
+    }
+    pub fn to_vector(self, thread: &mut SchemeThread) -> Result<Value, Value> {
+        let mut res = make_vector(thread, 4);
+        let mut el = self;
+        while !el.is_null() {
+            if !el.consp() {
+                let tag = thread.runtime.global_symbol(runtime::Global::ScmEval);
+                let msg = make_string(
+                    thread,
+                    "Only null terminated lists of cons cells can be converted to vec",
+                );
+                return Err(Value::new(make_exception(
+                    thread,
+                    tag,
+                    msg,
+                    Value::new(Null),
+                )));
+            }
+            let cons = el.cons();
+            res.vec.push(&mut thread.mutator, cons.car);
+            el = cons.cdr;
+        }
+        Ok(Value::new(res))
     }
     pub fn to_boolean(self) -> bool {
         if self.boolp() {
@@ -1041,6 +1051,26 @@ impl Value {
     pub fn applicablep(self) -> bool {
         self.closurep() || self.prototypep() || self.native_functionp()
     }
+
+    pub fn is_cell<T: Collectable>(self) -> bool {
+        self.is_object() && self.get_object().is::<T>()
+    }
+
+    pub fn flonump(self) -> bool {
+        self.is_double()
+    }
+
+    pub fn bignump(self) -> bool {
+        self.is_cell::<ScmBignum>()
+    }
+
+    pub fn complexp(self) -> bool {
+        self.is_cell::<ScmComplex>()
+    }
+
+    pub fn rationalp(self) -> bool {
+        self.is_cell::<ScmRational>()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1121,3 +1151,33 @@ impl Value {
         }
     }
 }
+
+pub struct ScmComplex {
+    pub complex: num::complex::Complex64,
+}
+
+unsafe impl Trace for ScmComplex {
+    fn trace(&mut self, _vis: &mut dyn Visitor) {}
+}
+unsafe impl Finalize for ScmComplex {}
+impl Collectable for ScmComplex {}
+
+pub struct ScmRational {
+    pub rational: num::BigRational,
+}
+
+unsafe impl Trace for ScmRational {
+    fn trace(&mut self, _vis: &mut dyn Visitor) {}
+}
+unsafe impl Finalize for ScmRational {}
+impl Collectable for ScmRational {}
+
+pub struct ScmBignum {
+    pub num: num::BigInt,
+}
+
+unsafe impl Trace for ScmBignum {
+    fn trace(&mut self, _vis: &mut dyn Visitor) {}
+}
+unsafe impl Finalize for ScmBignum {}
+impl Collectable for ScmBignum {}

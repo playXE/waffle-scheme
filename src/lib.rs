@@ -32,4 +32,5 @@ macro_rules! debug_unreachable {
 
 pub mod compiler;
 pub mod init;
+pub mod jit;
 pub mod runtime;

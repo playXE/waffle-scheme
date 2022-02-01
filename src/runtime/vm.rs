@@ -21,12 +21,12 @@ use super::{
 
 pub struct Frame {
     pub prev: *mut Frame,
-    p: Managed<ScmPrototype>,
-    c: Option<Managed<Closure>>,
-    stack: *mut Value,
-    locals: *mut Value,
-    upvalues: *mut Value,
-    si: usize,
+    pub p: Managed<ScmPrototype>,
+    pub c: Option<Managed<Closure>>,
+    pub stack: *mut Value,
+    pub locals: *mut Value,
+    pub upvalues: *mut Value,
+    pub si: usize,
 }
 unsafe impl Trace for Frame {
     fn trace(&mut self, vis: &mut dyn comet::api::Visitor) {
@@ -161,7 +161,9 @@ pub fn vm_apply(
                     return $val;
                 };
             }
-            if args.len() < prototype.arguments as usize {
+            if args.len() < prototype.arguments as usize
+                && (!prototype.variable_arity && args.len() != prototype.arguments as usize - 1)
+            {
                 println!("{}", Value::new(prototype));
 
                 vm_ret!(Err(arity_error_least(
@@ -246,6 +248,9 @@ pub fn vm_apply(
                         f.si += 1;
                     }
                     Op::UpvalueGet(x) => {
+                        if x as usize >= closure.unwrap_unchecked().upvalues.len() {
+                            panic!("wtf {} {}", Value::new(prototype), x);
+                        }
                         f.stack
                             .add(f.si)
                             .write(closure.unwrap_unchecked().upvalues[x as usize].upvalue());
@@ -278,6 +283,7 @@ pub fn vm_apply(
                                 c.upvalues
                                     .push(&mut thread.mutator, f.upvalues.add(l.index as _).read());
                             } else {
+                                println!("{}", Value::new(closure.unwrap().prototype));
                                 c.upvalues.push(
                                     &mut thread.mutator,
                                     closure.unwrap_unchecked().upvalues[l.index as usize],
@@ -370,6 +376,19 @@ pub fn apply(
 ) -> Result<Value, Value> {
     let mut args = args.to_vec();
     loop {
+        if !function.applicablep() {
+            let tag = thread.runtime.global_symbol(Global::ScmEval);
+            let message = make_string(
+                thread,
+                format!("attempt to apply non-function {}", function),
+            );
+            return Err(Value::new(make_exception(
+                thread,
+                tag,
+                message,
+                Value::new(Null),
+            )));
+        }
         let mut trampoline = false;
         if function.native_functionp() {
             let native = function.downcast::<NativeFunction>();
