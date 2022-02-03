@@ -50,7 +50,12 @@ pub fn subr_thread_spawn(thread: &mut SchemeThread, args: &[Value]) -> Result<Va
             mutator: mutator.clone(),
             trampoline_arguments: vec![],
             trampoline_fn: Value::new(Null),
+            stack: vec![Value::encode_undefined_value(); 8192].into_boxed_slice(),
+            sp: null_mut(),
+            end: null_mut(),
         }));
+        thread.sp = &mut thread.stack[0];
+        thread.end = &mut thread.stack[thread.stack.len() - 1];
         let mut thread = SchemeThreadRef {
             ptr: unsafe { NonNull::new_unchecked(thread) },
         };

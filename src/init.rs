@@ -770,4 +770,21 @@ fn init_core(thread: &mut SchemeThread) {
         false,
         false,
     );
+    defun(
+        thread,
+        "sleep",
+        |thread, args| {
+            if !args[0].fixnump() {
+                return Err(wrong_type_argument(thread, "sleep", "integer", args[0], 1));
+            }
+            let ms = std::time::Duration::from_millis(args[0].get_int32() as _);
+            let state = thread.mutator.enter_unsafe();
+            std::thread::sleep(ms);
+            drop(state);
+            Ok(Value::new(false))
+        },
+        1,
+        false,
+        false,
+    );
 }

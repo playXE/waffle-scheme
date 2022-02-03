@@ -1,4 +1,8 @@
-use std::mem::size_of;
+use std::{
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicPtr, AtomicUsize},
+};
 
 use comet::{api::Trace, letroot};
 use comet_extra::alloc::vector::Vector;
@@ -1006,6 +1010,8 @@ impl Compiler {
                 locals: self.locals as _,
                 name: self.name,
                 stack_max: self.stack_max as _,
+                n_calls: AtomicUsize::new(0),
+                jit_code: AtomicPtr::new(null_mut()),
             },
             comet::gc_base::AllocationSpace::Old,
         )

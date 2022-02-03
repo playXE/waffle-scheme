@@ -1,4 +1,8 @@
-use std::{hash::Hash, ptr::NonNull};
+use std::{
+    hash::Hash,
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+};
 
 use crate::{Heap, *};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
@@ -594,6 +598,32 @@ pub struct ScmPrototype {
     pub(crate) local_free_variable_count: u16,
     pub(crate) arguments: u16,
     pub(crate) variable_arity: bool,
+    pub(crate) jit_code: AtomicPtr<u8>,
+    pub(crate) n_calls: AtomicUsize,
+}
+
+impl ScmPrototype {
+    pub fn inc_call(self: Managed<ScmPrototype>, thread: &mut SchemeThread) {
+        //return;
+        if self
+            .n_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+            == thread.runtime.inner().hotness
+        {
+            let lock = thread.runtime.inner().compile_queue.lock();
+            let code = thread
+                .runtime
+                .inner()
+                .jit
+                .compile(self, thread.runtime.inner().dump_jit);
+            self.jit_code.store(code as _, Ordering::Relaxed);
+            self.n_calls.store(888888, Ordering::Relaxed);
+
+            drop(lock);
+            //thread.runtime.inner().compile_queue_wake.notify_one();
+        }
+    }
 }
 
 /// A closure, aka a function which references free variables
@@ -631,6 +661,7 @@ pub type NativeCallback = fn(&mut SchemeThread, args: &[Value]) -> Result<Value,
 pub struct NativeFunction {
     pub(crate) callback: NativeCallback,
     pub(crate) arguments: usize,
+    pub(crate) name: Value,
     pub(crate) variable_arity: bool,
 }
 

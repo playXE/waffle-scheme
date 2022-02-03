@@ -1,5 +1,5 @@
 #![feature(arbitrary_self_types, vec_retain_mut)]
-use comet::api::Gc;
+use comet::api::{Collectable, Gc, HeapObjectHeader};
 
 #[cfg(feature = "immix")]
 pub type Heap = comet::immix::Immix;

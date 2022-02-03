@@ -22,13 +22,15 @@ use super::{
 #[repr(C)]
 pub struct Frame {
     pub prev: *mut Frame,
-    pub p: Managed<ScmPrototype>,
-    pub c: Option<Managed<Closure>>,
 
+    pub sp: *mut Value,
     pub stack: *mut Value,
     pub locals: *mut Value,
     pub upvalues: *mut Value,
     pub si: usize,
+    pub exit_on_return: Value,
+    pub p: Managed<ScmPrototype>,
+    pub c: Option<Managed<Closure>>,
 }
 unsafe impl Trace for Frame {
     fn trace(&mut self, vis: &mut dyn comet::api::Visitor) {
@@ -63,12 +65,28 @@ impl Frame {
             p,
             c,
             stack,
-
+            exit_on_return: Value::new(false),
+            sp: null_mut(),
             locals,
             upvalues: null_mut(),
             si: 0,
         }
     }
+}
+
+fn check_arguments(
+    thread: &mut SchemeThread,
+    argc: usize,
+    prototype: Managed<ScmPrototype>,
+) -> Result<(), Value> {
+    if argc < prototype.arguments as usize
+        && (!prototype.variable_arity && argc != prototype.arguments as usize - 1)
+    {
+        return Err(arity_error_least(thread, prototype.arguments as _, argc));
+    } else if argc > prototype.arguments as usize && !prototype.variable_arity {
+        return Err(arity_error_most(thread, prototype.arguments as _, argc));
+    }
+    Ok(())
 }
 
 pub fn arity_error_least(thread: &mut SchemeThread, expected: usize, got: usize) -> Value {
@@ -163,21 +181,6 @@ pub fn vm_apply(
                     thread.current_frame = (*prev).prev;
                     return $val;
                 };
-            }
-            if args.len() < prototype.arguments as usize
-                && (!prototype.variable_arity && args.len() != prototype.arguments as usize - 1)
-            {
-                vm_ret!(Err(arity_error_least(
-                    thread,
-                    prototype.arguments as _,
-                    args.len()
-                )));
-            } else if args.len() > prototype.arguments as usize && !prototype.variable_arity {
-                vm_ret!(Err(arity_error_most(
-                    thread,
-                    prototype.arguments as _,
-                    args.len()
-                )));
             }
 
             for i in 0..prototype.arguments {
@@ -338,12 +341,8 @@ pub fn vm_apply(
                             ),
                         );
                         if let Err(e) = tmp {
-                            for i in 0..prototype.local_free_variable_count {
-                                (*f.upvalues.add(i as usize)).upvalue_close();
-                            }
-                            let prev = thread.current_frame;
-                            thread.current_frame = (*prev).prev;
-                            return Err(e);
+                            println!("{}", e);
+                            vm_ret!(Err(e));
                         } else if let Ok(val) = tmp {
                             f.si -= argc as usize;
                             f.stack.add(f.si).write(val);
@@ -405,15 +404,53 @@ pub fn apply(
                 Some(function.downcast::<Closure>()),
             )
         };
+        check_arguments(thread, args.len(), prototype)?;
+        let jit_code = prototype
+            .jit_code
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = if jit_code.is_null() {
+            prototype.inc_call(thread);
+            vm_apply(
+                thread,
+                prototype,
+                closure,
+                args.len(),
+                &args,
+                &mut trampoline,
+            )
+        } else {
+            let mut thrown = false;
+            let func = unsafe {
+                std::mem::transmute::<
+                    _,
+                    extern "C" fn(
+                        &mut SchemeThread,
+                        Managed<ScmPrototype>,
+                        Option<Managed<Closure>>,
+                        usize,
+                        *const Value,
+                        &mut bool,
+                        &mut bool,
+                    ) -> Value,
+                >(jit_code)
+            };
 
-        let result = vm_apply(
-            thread,
-            prototype,
-            closure,
-            args.len(),
-            &args,
-            &mut trampoline,
-        );
+            let val = func(
+                thread,
+                prototype,
+                closure,
+                args.len(),
+                args.as_ptr(),
+                &mut trampoline,
+                &mut thrown,
+            );
+            if thrown {
+                Err(val)
+            } else {
+                Ok(val)
+            }
+        };
+
         args.clear();
         if trampoline && result.is_ok() {
             function = thread.trampoline_fn;

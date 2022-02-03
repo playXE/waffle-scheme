@@ -1,13 +1,15 @@
 use self::{
     value::{
         Macro, NativeCallback, NativeFunction, Null, ScmBignum, ScmBlob, ScmBox, ScmComplex,
-        ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
+        ScmCons, ScmException, ScmPrototype, ScmRational, ScmString, ScmSymbol, ScmTable,
+        ScmVector, Value,
     },
     vm::Frame,
 };
 use crate::{
     compiler::{make_env, Compiler},
     init::enable_core,
+    jit::{compile_thread, Jit},
     runtime::value::Closure,
     Heap, Managed,
 };
@@ -15,7 +17,7 @@ use comet::{
     api::Trace,
     gc_base::{AllocationSpace, MarkingConstraint},
     letroot,
-    mutator::MutatorRef,
+    mutator::{JoinData, MutatorRef},
 };
 
 use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
@@ -23,11 +25,11 @@ use std::{
     mem::size_of,
     ops::{Deref, DerefMut},
     ptr::{null_mut, NonNull},
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicBool, AtomicU64},
 };
 
 pub mod arith;
-pub mod interpreter;
+//pub mod interpreter;
 pub mod subr_arith;
 pub mod threading;
 pub mod value;
@@ -39,6 +41,10 @@ pub struct SchemeThread {
     pub runtime: Runtime,
     pub(crate) trampoline_arguments: Vec<Value>,
     pub(crate) trampoline_fn: Value,
+
+    pub(crate) sp: *mut Value,
+    pub(crate) end: *mut Value,
+    pub(crate) stack: Box<[Value]>,
 
     pub(crate) rc: u32,
 }
@@ -94,7 +100,7 @@ unsafe impl Trace for SchemeThread {
         }
     }
 }
-use parking_lot::{lock_api::RawMutex, RawMutex as Lock};
+use parking_lot::{lock_api::RawMutex, Condvar, Mutex, RawMutex as Lock};
 #[allow(dead_code)]
 pub(crate) struct RtInner {
     pub(crate) core_module: Option<Managed<ScmTable>>,
@@ -107,6 +113,14 @@ pub(crate) struct RtInner {
     pub(crate) threads: Vec<SchemeThreadRef>,
     pub(crate) global_lock: Lock,
     pub(crate) dump_bytecode: bool,
+
+    pub(crate) compile_queue_wake: Condvar,
+    pub(crate) compile_queue: Mutex<Vec<Managed<ScmPrototype>>>,
+    pub(crate) compile_thread_terminating: AtomicBool,
+    pub(crate) compile_thread_handle: Option<JoinData>,
+    pub(crate) dump_jit: bool,
+    pub(crate) jit: Jit,
+    pub(crate) hotness: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,24 +167,38 @@ unsafe impl MarkingConstraint for MarkRt {
             rt.threads.iter_mut().for_each(|thread| {
                 thread.trace(vis);
             });
+            // very unsafe, be acqurate with this
+            rt.compile_queue.get_mut().trace(vis);
         }
     }
 }
 
 impl Runtime {
-    pub fn new(heap: MutatorRef<Heap>, dump_bytecode: bool) -> SchemeThreadRef {
+    pub fn new(
+        heap: MutatorRef<Heap>,
+        dump_bytecode: bool,
+        dump_jit: bool,
+        hotness: usize,
+    ) -> SchemeThreadRef {
         let rt = Runtime {
             inner: NonNull::new(Box::into_raw(Box::new(RtInner {
                 core_module: None,
                 user_module: None,
                 symbol_table: None,
                 globals: vec![],
+                compile_queue_wake: Condvar::new(),
                 qualified_imports: vec![],
                 module_search_paths: vec![],
                 threads: vec![],
+                compile_queue: Mutex::new(vec![]),
                 modules: None,
                 dump_bytecode,
+                compile_thread_terminating: AtomicBool::new(false),
+                compile_thread_handle: None,
+                dump_jit,
+                jit: Jit::new(),
                 global_lock: Lock::INIT,
+                hotness,
             })))
             .unwrap(),
         };
@@ -182,9 +210,15 @@ impl Runtime {
                 trampoline_arguments: vec![],
                 trampoline_fn: Value::encode_null_value(),
                 rc: 1,
+                sp: null_mut(),
+                stack: vec![Value::encode_undefined_value(); 8192].into_boxed_slice(),
+                end: null_mut(),
             })))
             .unwrap(),
         };
+        thread.sp = &mut thread.stack[0];
+        let at = thread.stack.len() - 1;
+        thread.end = &mut thread.stack[at];
         rt.inner().threads.push(thread.clone());
         rt.inner().symbol_table = Some(make_table(&mut thread, 8));
         for sym in GLOBAL_SYMBOLS.iter() {
@@ -217,9 +251,21 @@ impl Runtime {
 
         let mark = MarkRt(rt.inner);
         thread.mutator.add_constraint(mark);
-
+        let rt2 = rt;
+        rt.inner().compile_thread_handle = Some(thread.mutator.spawn_mutator(move |mutator| {
+            compile_thread(mutator, rt2);
+        }));
         enable_core(&mut thread);
         thread
+    }
+
+    pub fn terminate(rt: Self, mutator: &MutatorRef<Heap>) {
+        let inner = rt.inner();
+        inner
+            .compile_thread_terminating
+            .store(true, std::sync::atomic::Ordering::Release);
+        inner.compile_queue_wake.notify_all();
+        inner.compile_thread_handle.take().unwrap().join(mutator);
     }
 }
 
@@ -457,6 +503,7 @@ pub fn make_table(thread: &mut SchemeThread, mut capacity: usize) -> Managed<Scm
 
 pub fn make_native_function(
     thread: &mut SchemeThread,
+    name: Value,
     ptr: NativeCallback,
     arguments: usize,
     variable_arity: bool,
@@ -466,6 +513,7 @@ pub fn make_native_function(
             arguments,
             variable_arity,
             callback: ptr,
+            name,
         },
         AllocationSpace::New,
     )
@@ -514,7 +562,8 @@ pub fn defun(
     variable_arity: bool,
     mutable: bool,
 ) {
-    let fun = make_native_function(thread, ptr, arguments, variable_arity);
+    let name_ = make_string(thread, name);
+    let fun = make_native_function(thread, Value::new(name_), ptr, arguments, variable_arity);
     let name = make_symbol(thread, name);
     let core = thread.runtime.inner().core_module;
     env_define(
@@ -872,8 +921,9 @@ impl std::fmt::Display for Value {
         } else if self.native_functionp() {
             write!(
                 f,
-                "#<native function at {:p}>",
-                self.downcast::<NativeFunction>().callback as usize as *const u8
+                "#<native function '{}' at {:p}>",
+                self.downcast::<NativeFunction>().name,
+                self.downcast::<NativeFunction>().callback as usize as *const u8,
             )
         } else if self.tablep() {
             write!(f, "#<table at {:p}>", self.get_object())

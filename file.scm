@@ -1,6 +1,3 @@
-(module foo)
 (import core)
 
-(defun simple () (displayln (thread-id)) 24)
-
-(parallel simple simple)
+(map displayln (list 1 2 3 4 5))

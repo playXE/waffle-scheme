@@ -3,15 +3,17 @@ use comet::{
     letroot,
 };
 use rustyline::{config::Configurer, Editor};
-use std::path::PathBuf;
+use std::{path::PathBuf, ptr::null_mut};
 use structopt::StructOpt;
 use waffle::{
     compiler::Compiler,
+    jit::Jit,
     runtime::{
         add_module_search_path, load_file,
-        value::{Null, Value},
+        value::{Closure, Null, ScmPrototype, Value},
         Runtime, SchemeThread,
     },
+    Managed,
 };
 
 #[derive(Debug, StructOpt)]
@@ -19,6 +21,14 @@ use waffle::{
 pub struct Options {
     #[structopt(long, help = "Prints debug messages during compilation process")]
     debug_cc: bool,
+    #[structopt(long, help = "Prints Cranelift IR and assembly of JIT compiled code")]
+    dump_jit: bool,
+    #[structopt(
+        long,
+        help = "Threshold after which we compile Scheme code using JIT",
+        default_value = "10"
+    )]
+    hotness: usize,
     #[structopt(
         long,
         help = "Changes GC verbose level: 1 - least verbose, 2 - most verbose",
@@ -53,11 +63,48 @@ fn main() {
         .with_min_heap_size(opts.heap_min_size * 1024 * 1024)
         .with_initial_size(opts.heap_initial_size * 1024 * 1024);
     let immix = instantiate_immix(immix_opts);
-    let mut thread = Runtime::new(immix, opts.debug_cc);
+    let mut thread = Runtime::new(immix, opts.debug_cc, opts.dump_jit, opts.hotness);
     add_module_search_path(&mut thread, "./");
     for path in opts.module_search_paths.iter() {
         add_module_search_path(&mut thread, path);
     }
+    /*
+    let mut cc = Compiler::new(&mut thread, None, None, 0);
+    let sexp = lexpr::from_str("(+ 1 2)").unwrap();
+    let _ = cc.compile(&mut thread, &sexp, false);
+    let proto = cc.end(&mut thread, 0, false);
+
+    let mut jit = Jit::new();
+
+    let code = jit.compile(proto);
+
+    let fun = unsafe {
+        std::mem::transmute::<
+            _,
+            extern "C" fn(
+                &mut SchemeThread,
+                Managed<ScmPrototype>,
+                Option<Managed<Closure>>,
+                usize,
+                *mut Value,
+                *mut bool,
+                *mut bool,
+            ) -> Value,
+        >(code)
+    };
+    let mut did_throw = false;
+
+    let val = fun(
+        &mut thread,
+        proto,
+        None,
+        0,
+        null_mut(),
+        &mut false,
+        &mut did_throw,
+    );
+    println!("{} {}", did_throw, val);*/
+
     if let Some(ref file) = opts.filename {
         match load_file(&mut thread, file, Value::new(Null)) {
             Ok(x) => {
@@ -67,6 +114,8 @@ fn main() {
                 println!("Error: {}", e);
             }
         }
+        let rt = thread.runtime;
+        Runtime::terminate(rt, &thread.mutator);
     } else {
         repl(&mut thread);
     }
