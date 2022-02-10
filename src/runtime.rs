@@ -1,31 +1,29 @@
 use self::{
     value::{
         Macro, NativeCallback, NativeFunction, Null, ScmBignum, ScmBlob, ScmBox, ScmComplex,
-        ScmCons, ScmException, ScmPrototype, ScmRational, ScmString, ScmSymbol, ScmTable,
-        ScmVector, Value,
+        ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
     },
-    vm::Frame,
+    vm::VMStack,
 };
 use crate::{
     compiler::{make_env, Compiler},
     init::enable_core,
-    jit::{compile_thread, Jit},
     runtime::value::Closure,
     Heap, Managed,
 };
 use comet::{
     api::Trace,
-    gc_base::{AllocationSpace, MarkingConstraint},
+    gc_base::{AllocationSpace, MarkingConstraint, StackValueDecoder},
     letroot,
-    mutator::{JoinData, MutatorRef},
+    mutator::MutatorRef,
 };
 
 use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 use std::{
     mem::size_of,
     ops::{Deref, DerefMut},
-    ptr::{null_mut, NonNull},
-    sync::atomic::{AtomicBool, AtomicU64},
+    ptr::NonNull,
+    sync::atomic::AtomicU64,
 };
 
 pub mod arith;
@@ -36,15 +34,11 @@ pub mod value;
 pub mod vm;
 #[repr(C)]
 pub struct SchemeThread {
-    pub(crate) current_frame: *mut Frame,
+    pub(crate) vm_stack: VMStack,
     pub mutator: MutatorRef<Heap>,
     pub runtime: Runtime,
     pub(crate) trampoline_arguments: Vec<Value>,
     pub(crate) trampoline_fn: Value,
-
-    pub(crate) sp: *mut Value,
-    pub(crate) end: *mut Value,
-    pub(crate) stack: Box<[Value]>,
 
     pub(crate) rc: u32,
 }
@@ -91,16 +85,10 @@ unsafe impl Trace for SchemeThread {
     fn trace(&mut self, vis: &mut dyn comet::api::Visitor) {
         self.trampoline_arguments.trace(vis);
         self.trampoline_fn.trace(vis);
-        unsafe {
-            let mut frame = self.current_frame;
-            while !frame.is_null() {
-                (*frame).trace(vis);
-                frame = (*frame).prev;
-            }
-        }
+        self.vm_stack.trace(vis);
     }
 }
-use parking_lot::{lock_api::RawMutex, Condvar, Mutex, RawMutex as Lock};
+use parking_lot::{lock_api::RawMutex, RawMutex as Lock};
 #[allow(dead_code)]
 pub(crate) struct RtInner {
     pub(crate) core_module: Option<Managed<ScmTable>>,
@@ -114,12 +102,6 @@ pub(crate) struct RtInner {
     pub(crate) global_lock: Lock,
     pub(crate) dump_bytecode: bool,
 
-    pub(crate) compile_queue_wake: Condvar,
-    pub(crate) compile_queue: Mutex<Vec<Managed<ScmPrototype>>>,
-    pub(crate) compile_thread_terminating: AtomicBool,
-    pub(crate) compile_thread_handle: Option<JoinData>,
-    pub(crate) dump_jit: bool,
-    pub(crate) jit: Jit,
     pub(crate) hotness: usize,
 }
 
@@ -167,8 +149,6 @@ unsafe impl MarkingConstraint for MarkRt {
             rt.threads.iter_mut().for_each(|thread| {
                 thread.trace(vis);
             });
-            // very unsafe, be acqurate with this
-            rt.compile_queue.get_mut().trace(vis);
         }
     }
 }
@@ -177,7 +157,7 @@ impl Runtime {
     pub fn new(
         heap: MutatorRef<Heap>,
         dump_bytecode: bool,
-        dump_jit: bool,
+        _dump_jit: bool,
         hotness: usize,
     ) -> SchemeThreadRef {
         let rt = Runtime {
@@ -186,17 +166,14 @@ impl Runtime {
                 user_module: None,
                 symbol_table: None,
                 globals: vec![],
-                compile_queue_wake: Condvar::new(),
+
                 qualified_imports: vec![],
                 module_search_paths: vec![],
                 threads: vec![],
-                compile_queue: Mutex::new(vec![]),
+
                 modules: None,
                 dump_bytecode,
-                compile_thread_terminating: AtomicBool::new(false),
-                compile_thread_handle: None,
-                dump_jit,
-                jit: Jit::new(),
+
                 global_lock: Lock::INIT,
                 hotness,
             })))
@@ -206,19 +183,15 @@ impl Runtime {
             ptr: NonNull::new(Box::into_raw(Box::new(SchemeThread {
                 runtime: rt,
                 mutator: heap.clone(),
-                current_frame: null_mut(),
+
                 trampoline_arguments: vec![],
                 trampoline_fn: Value::encode_null_value(),
                 rc: 1,
-                sp: null_mut(),
-                stack: vec![Value::encode_undefined_value(); 8192].into_boxed_slice(),
-                end: null_mut(),
+                vm_stack: VMStack::new(),
             })))
             .unwrap(),
         };
-        thread.sp = &mut thread.stack[0];
-        let at = thread.stack.len() - 1;
-        thread.end = &mut thread.stack[at];
+
         rt.inner().threads.push(thread.clone());
         rt.inner().symbol_table = Some(make_table(&mut thread, 8));
         for sym in GLOBAL_SYMBOLS.iter() {
@@ -251,22 +224,12 @@ impl Runtime {
 
         let mark = MarkRt(rt.inner);
         thread.mutator.add_constraint(mark);
-        let rt2 = rt;
-        rt.inner().compile_thread_handle = Some(thread.mutator.spawn_mutator(move |mutator| {
-            compile_thread(mutator, rt2);
-        }));
+
         enable_core(&mut thread);
         thread
     }
 
-    pub fn terminate(rt: Self, mutator: &MutatorRef<Heap>) {
-        let inner = rt.inner();
-        inner
-            .compile_thread_terminating
-            .store(true, std::sync::atomic::Ordering::Release);
-        inner.compile_queue_wake.notify_all();
-        inner.compile_thread_handle.take().unwrap().join(mutator);
-    }
+    pub fn terminate(_rt: Self, _mutator: &MutatorRef<Heap>) {}
 }
 
 pub(crate) static ID: AtomicU64 = AtomicU64::new(0);
@@ -958,6 +921,7 @@ pub fn value_to_lexpr(thread: &mut SchemeThread, val: Value) -> lexpr::Value {
             value_to_lexpr(thread, val.cdr()),
         ))
     } else {
+        println!("{}", val);
         todo!()
     }
 }
@@ -1031,4 +995,23 @@ pub fn make_rational(thread: &mut SchemeThread, n: num::BigRational) -> Managed<
     thread
         .mutator
         .allocate(ScmRational { rational: n }, AllocationSpace::New)
+}
+
+pub struct NanBoxedDecoder;
+
+impl StackValueDecoder for NanBoxedDecoder {
+    fn decode(ptr: *mut u8) -> *mut u8 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let val = unsafe { std::mem::transmute::<_, Value>(ptr) };
+            if val.is_object() {
+                return val.get_object_raw().cast();
+            }
+            return ptr;
+        }
+        #[cfg(target_pointer_width = "32")]
+        {
+            return ptr;
+        }
+    }
 }

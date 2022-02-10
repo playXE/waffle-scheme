@@ -1,7 +1,7 @@
 use std::{
     hash::Hash,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
 use crate::{Heap, *};
@@ -602,30 +602,6 @@ pub struct ScmPrototype {
     pub(crate) n_calls: AtomicUsize,
 }
 
-impl ScmPrototype {
-    pub fn inc_call(self: Managed<ScmPrototype>, thread: &mut SchemeThread) {
-        //return;
-        if self
-            .n_calls
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1
-            == thread.runtime.inner().hotness
-        {
-            let lock = thread.runtime.inner().compile_queue.lock();
-            let code = thread
-                .runtime
-                .inner()
-                .jit
-                .compile(self, thread.runtime.inner().dump_jit);
-            self.jit_code.store(code as _, Ordering::Relaxed);
-            self.n_calls.store(888888, Ordering::Relaxed);
-
-            drop(lock);
-            //thread.runtime.inner().compile_queue_wake.notify_one();
-        }
-    }
-}
-
 /// A closure, aka a function which references free variables
 pub struct Closure {
     pub(crate) prototype: Managed<ScmPrototype>,
@@ -677,7 +653,11 @@ unsafe impl Trace for Macro {
 unsafe impl Finalize for Macro {}
 impl Collectable for Macro {}
 
-unsafe impl Trace for NativeFunction {}
+unsafe impl Trace for NativeFunction {
+    fn trace(&mut self, vis: &mut dyn Visitor) {
+        self.name.trace(vis);
+    }
+}
 unsafe impl Finalize for NativeFunction {}
 impl Collectable for NativeFunction {}
 pub struct Upvalue {
@@ -751,7 +731,12 @@ pub struct ScmCons {
     pub cdr: Value,
 }
 
-unsafe impl Trace for ScmCons {}
+unsafe impl Trace for ScmCons {
+    fn trace(&mut self, vis: &mut dyn Visitor) {
+        self.car.trace(vis);
+        self.cdr.trace(vis);
+    }
+}
 unsafe impl Finalize for ScmCons {}
 impl Collectable for ScmCons {}
 
@@ -836,6 +821,14 @@ impl Value {
     }
     pub fn tablep(self) -> bool {
         self.is_object() && self.get_object().is::<ScmTable>()
+    }
+    pub fn upvalue_addr(self) -> *mut Value {
+        let mut upval = self.downcast::<Upvalue>();
+        if upval.closed {
+            unsafe { &mut upval.upval.converted }
+        } else {
+            unsafe { upval.upval.local }
+        }
     }
     pub fn downcast<U: Collectable>(self) -> Managed<U> {
         debug_assert!(self.is_object() && self.get_object().is::<U>());

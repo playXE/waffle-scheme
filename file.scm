@@ -1,3 +1,7 @@
 (import core)
 
-(map displayln (list 1 2 3 4 5))
+(defun print-thread-id () (displayln (thread-id)))
+
+(parallel print-thread-id print-thread-id print-thread-id)
+
+(gc)

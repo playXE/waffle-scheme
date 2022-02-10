@@ -1,4 +1,4 @@
-use std::ptr::{null_mut, NonNull};
+use std::ptr::NonNull;
 
 use comet::api::{Collectable, Finalize, Trace};
 use parking_lot::lock_api::RawMutex;
@@ -11,6 +11,7 @@ use crate::{
 use super::{
     defun, make_exception, make_string,
     value::{Null, Value},
+    vm::VMStack,
     SchemeThread,
 };
 
@@ -44,18 +45,15 @@ pub fn subr_thread_spawn(thread: &mut SchemeThread, args: &[Value]) -> Result<Va
 
     let handle = thread.mutator.spawn_mutator(move |mutator| {
         let thread = Box::leak(Box::new(SchemeThread {
-            current_frame: null_mut(),
             rc: 1,
             runtime: rt,
             mutator: mutator.clone(),
             trampoline_arguments: vec![],
             trampoline_fn: Value::new(Null),
-            stack: vec![Value::encode_undefined_value(); 8192].into_boxed_slice(),
-            sp: null_mut(),
-            end: null_mut(),
+
+            vm_stack: VMStack::new(),
         }));
-        thread.sp = &mut thread.stack[0];
-        thread.end = &mut thread.stack[thread.stack.len() - 1];
+
         let mut thread = SchemeThreadRef {
             ptr: unsafe { NonNull::new_unchecked(thread) },
         };

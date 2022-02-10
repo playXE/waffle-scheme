@@ -1,8 +1,6 @@
-use crate::Managed;
-
 use super::{
     make_bignum,
-    value::{ScmBignum, ScmRational, Value},
+    value::{ScmBignum, Value},
     SchemeThread,
 };
 

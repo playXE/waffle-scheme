@@ -3,17 +3,15 @@ use comet::{
     letroot,
 };
 use rustyline::{config::Configurer, Editor};
-use std::{path::PathBuf, ptr::null_mut};
+use std::path::PathBuf;
 use structopt::StructOpt;
 use waffle::{
     compiler::Compiler,
-    jit::Jit,
     runtime::{
         add_module_search_path, load_file,
-        value::{Closure, Null, ScmPrototype, Value},
-        Runtime, SchemeThread,
+        value::{Null, Value},
+        NanBoxedDecoder, Runtime, SchemeThread,
     },
-    Managed,
 };
 
 #[derive(Debug, StructOpt)]
@@ -62,7 +60,7 @@ fn main() {
         .with_max_heap_size(opts.heap_max_size * 1024 * 1024)
         .with_min_heap_size(opts.heap_min_size * 1024 * 1024)
         .with_initial_size(opts.heap_initial_size * 1024 * 1024);
-    let immix = instantiate_immix(immix_opts);
+    let immix = instantiate_immix::<NanBoxedDecoder>(immix_opts);
     let mut thread = Runtime::new(immix, opts.debug_cc, opts.dump_jit, opts.hotness);
     add_module_search_path(&mut thread, "./");
     for path in opts.module_search_paths.iter() {

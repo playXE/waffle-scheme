@@ -1,8 +1,9 @@
 #![feature(arbitrary_self_types, vec_retain_mut)]
 use comet::api::{Collectable, Gc, HeapObjectHeader};
+use runtime::NanBoxedDecoder;
 
 #[cfg(feature = "immix")]
-pub type Heap = comet::immix::Immix;
+pub type Heap = comet::immix::Immix<NanBoxedDecoder>;
 #[cfg(feature = "minimark")]
 pub type Heap = comet::minimark::MiniMark;
 #[cfg(feature = "marksweep")]
@@ -32,5 +33,5 @@ macro_rules! debug_unreachable {
 
 pub mod compiler;
 pub mod init;
-pub mod jit;
+//pub mod jit;
 pub mod runtime;

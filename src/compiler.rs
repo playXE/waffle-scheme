@@ -13,7 +13,6 @@ use crate::{
         load_module, make_blob, make_exception, make_string, make_symbol, make_table, make_vector,
         module_loaded, register_module_,
         value::{Macro, Null, ScmPrototype, ScmString, ScmTable, Undefined, Value},
-        vm::apply,
         SchemeThread,
     },
     Heap, Managed,
@@ -372,7 +371,8 @@ impl Compiler {
     ) -> Result<Value, Value> {
         let exp = lexpr_to_value(thread, exp).to_vec(thread)?;
         let p = p.downcast::<Macro>();
-        apply(thread, Value::new(p.p), &exp)
+
+        crate::runtime::vm::apply(thread, Value::new(p.p), &exp)
     }
 
     pub fn macro_expand_full(
@@ -383,7 +383,7 @@ impl Compiler {
     ) -> Result<lexpr::Value, Value> {
         let expanded = self.macro_expand_1_step(thread, p, exp)?;
         let mut expanded = crate::runtime::value_to_lexpr(thread, expanded);
-        println!("{}", expanded);
+
         if let Some(cons) = expanded.as_cons_mut() {
             if !cons.car().is_symbol() {
                 return Ok(expanded);

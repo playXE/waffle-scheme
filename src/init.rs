@@ -95,7 +95,27 @@ fn init_core(thread: &mut SchemeThread) {
             if !fun.applicablep() {
                 return Err(wrong_type_argument(thread, "apply", "procedure", fun, 1));
             }
-            crate::runtime::vm::apply(thread, fun, if args.len() > 1 { &args[1..] } else { &[] })
+            let pargs = if args.len() == 2 {
+                let list = args[1];
+
+                if !crate::runtime::listp(list) {
+                    return Err(wrong_type_argument(thread, "apply", "list", list, 2));
+                }
+                list.to_vec(thread).unwrap_or_else(|_| unreachable!())
+            } else if args.len() == 1 {
+                vec![]
+            } else {
+                let list = args.last().unwrap();
+                let up_to = args.len() - 2;
+                let other_args = &args[1..up_to];
+
+                let mut pargs = vec![];
+                pargs.extend_from_slice(other_args);
+                pargs.extend_from_slice(&list.to_vec(thread)?);
+                pargs
+            };
+
+            crate::runtime::vm::apply(thread, fun, &pargs)
         },
         1,
         true,
