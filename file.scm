@@ -1,7 +1,10 @@
 (import core)
 
-(defun print-thread-id () (displayln (thread-id)))
+(defun nano-to-milli (x) (/ x 1000000))
+(define start (time/now))
 
-(parallel print-thread-id print-thread-id print-thread-id)
-
-(gc)
+(for (x 0 (< x 1000000) (+ x 1)) 
+    
+)
+(define end (time/elapsed start))
+(displayln (nano-to-milli end))

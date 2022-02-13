@@ -5,6 +5,7 @@ use comet_extra::alloc::{array::Array, vector::Vector};
 
 use crate::{
     compiler::{Op, UpvalLoc},
+    method_jit::{JITSig, Trampoline},
     runtime::make_list,
     Managed,
 };
@@ -64,7 +65,7 @@ pub struct VMStack {
     end: *mut u8,
     cursor: *mut u8,
 
-    current_frame: *mut CallFrame,
+    pub(crate) current_frame: *mut CallFrame,
 }
 
 impl VMStack {
@@ -195,21 +196,21 @@ impl Drop for VMStack {
     }
 }
 pub struct CallFrame {
-    prev: *mut Self,
+    pub(crate) prev: *mut Self,
     /// Saved stack pointer. It points to the start of the frame
-    sp: *mut u8,
+    pub(crate) sp: *mut u8,
     /// Pointer to the start of value stack
-    bp: *mut Value,
+    pub(crate) bp: *mut Value,
     /// Pointer to the start of upvalue array
-    upvalues: *mut Value,
-    si: usize,
+    pub(crate) upvalues: *mut Value,
+    pub(crate) si: usize,
     /// Local variable storage, allocated at call site and freed when frame is exited
-    env: *mut Value,
-    exit_on_return: bool,
-    ip: usize,
-    code: Option<Managed<Array<u8>>>,
-    callee: Value,
-    closure: Option<Managed<Closure>>,
+    pub(crate) env: *mut Value,
+    pub(crate) exit_on_return: bool,
+    pub(crate) ip: usize,
+    pub(crate) code: Option<Managed<Array<u8>>>,
+    pub(crate) callee: Value,
+    pub(crate) closure: Option<Managed<Closure>>,
 }
 impl CallFrame {
     #[inline]
@@ -293,7 +294,12 @@ impl CallFrame {
     }
     #[inline(always)]
     pub unsafe fn upvalue(&mut self, at: u16) -> Value {
-        let val = self.closure.unwrap_unchecked().upvalues[at as usize].upvalue();
+        let val = self
+            .closure
+            .unwrap_unchecked()
+            .upvalues
+            .get_unchecked(at as usize)
+            .upvalue();
 
         val
     }
@@ -364,7 +370,7 @@ pub(crate) unsafe extern "C" fn close_over(thread: &mut SchemeThread, frame: &mu
     }
     frame.push(Value::new(c));
 }
-unsafe fn vm_loop(thread: &mut SchemeThread) -> Result<Value, Value> {
+unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<Value, Value> {
     let mut frame = &mut *(*thread).vm_stack.current_frame;
 
     loop {
@@ -461,14 +467,7 @@ unsafe fn vm_loop(thread: &mut SchemeThread) -> Result<Value, Value> {
                         }
                     }
                 } else {
-                    let env = match pre_call(thread, callee, args) {
-                        Ok(env) => env,
-                        Err(error) => {
-                            while !thread.vm_stack.leave_frame() {}
-                            return Err(error);
-                        }
-                    };
-                    let (_, closure) = if callee.is_cell::<ScmPrototype>() {
+                    let (proto, closure) = if callee.is_cell::<ScmPrototype>() {
                         (callee.downcast::<ScmPrototype>(), None)
                     } else {
                         (
@@ -476,17 +475,49 @@ unsafe fn vm_loop(thread: &mut SchemeThread) -> Result<Value, Value> {
                             Some(callee.downcast::<Closure>()),
                         )
                     };
+                    if !proto
+                        .jit_code
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .is_null()
+                        || proto
+                            .n_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            >= thread.runtime.inner().hotness
+                    {
+                        match apply(thread, callee, args) {
+                            Ok(val) => {
+                                for _ in 0..nargs {
+                                    frame.pop();
+                                }
+                                frame.push(val);
+                                continue;
+                            }
+                            Err(val) => {
+                                while !thread.vm_stack.leave_frame() {}
+                                return Err(val);
+                            }
+                        }
+                    } else {
+                        let env = match pre_call(thread, callee, args) {
+                            Ok(env) => env,
+                            Err(error) => {
+                                while !thread.vm_stack.leave_frame() {}
+                                return Err(error);
+                            }
+                        };
 
-                    let should_exit = thread.vm_stack.leave_frame();
-                    let new_frame = thread.vm_stack.make_frame(callee, closure, env, 0);
-                    if new_frame.is_null() {
-                        while !thread.vm_stack.leave_frame() {}
-                        return Err(stack_overflow(thread, callee));
+                        let should_exit = thread.vm_stack.leave_frame();
+                        let new_frame = thread.vm_stack.make_frame(callee, closure, env, 0);
+                        if new_frame.is_null() {
+                            while !thread.vm_stack.leave_frame() {}
+                            return Err(stack_overflow(thread, callee));
+                        }
+                        setup_upvalues(thread, &mut *new_frame);
+                        (*new_frame).exit_on_return = should_exit;
+
+                        frame = &mut *new_frame;
+                        continue;
                     }
-                    setup_upvalues(thread, &mut *new_frame);
-                    (*new_frame).exit_on_return = should_exit;
-                    frame = &mut *new_frame;
-                    continue;
                 }
             }
             Op::Apply(nargs) => {
@@ -514,17 +545,7 @@ unsafe fn vm_loop(thread: &mut SchemeThread) -> Result<Value, Value> {
                         }
                     }
                 } else {
-                    let env = match pre_call(thread, callee, args) {
-                        Ok(env) => env,
-                        Err(error) => {
-                            while !thread.vm_stack.leave_frame() {}
-                            return Err(error);
-                        }
-                    };
-                    for _ in 0..nargs {
-                        frame.pop();
-                    }
-                    let (_, closure) = if callee.is_cell::<ScmPrototype>() {
+                    let (proto, closure) = if callee.is_cell::<ScmPrototype>() {
                         (callee.downcast::<ScmPrototype>(), None)
                     } else {
                         (
@@ -532,17 +553,51 @@ unsafe fn vm_loop(thread: &mut SchemeThread) -> Result<Value, Value> {
                             Some(callee.downcast::<Closure>()),
                         )
                     };
+                    if proto
+                        .jit_code
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .is_null()
+                        || proto
+                            .n_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            >= thread.runtime.inner().hotness
+                    {
+                        match apply(thread, callee, args) {
+                            Ok(val) => {
+                                for _ in 0..nargs {
+                                    frame.pop();
+                                }
+                                frame.push(val);
+                                continue;
+                            }
+                            Err(val) => {
+                                while !thread.vm_stack.leave_frame() {}
+                                return Err(val);
+                            }
+                        }
+                    } else {
+                        let env = match pre_call(thread, callee, args) {
+                            Ok(env) => env,
+                            Err(error) => {
+                                while !thread.vm_stack.leave_frame() {}
+                                return Err(error);
+                            }
+                        };
+                        for _ in 0..nargs {
+                            frame.pop();
+                        }
 
-                    let new_frame = thread.vm_stack.make_frame(callee, closure, env, 0);
+                        let new_frame = thread.vm_stack.make_frame(callee, closure, env, 0);
 
-                    if new_frame.is_null() {
-                        while !thread.vm_stack.leave_frame() {}
-                        return Err(stack_overflow(thread, callee));
+                        if new_frame.is_null() {
+                            while !thread.vm_stack.leave_frame() {}
+                            return Err(stack_overflow(thread, callee));
+                        }
+                        setup_upvalues(thread, &mut *new_frame);
+                        (*new_frame).exit_on_return = false;
+                        frame = &mut *new_frame;
+                        continue;
                     }
-                    setup_upvalues(thread, &mut *new_frame);
-                    (*new_frame).exit_on_return = false;
-                    frame = &mut *new_frame;
-                    continue;
                 }
             }
             Op::CloseOver => {
@@ -622,45 +677,110 @@ pub unsafe extern "C" fn setup_upvalues(thread: &mut SchemeThread, frame: &mut C
     }
 }
 
-pub fn apply(thread: &mut SchemeThread, function: Value, args: &[Value]) -> Result<Value, Value> {
-    if function.native_functionp() {
-        let func = function.downcast::<NativeFunction>();
-        unsafe {
-            let frame = thread
-                .vm_stack
-                .make_frame(function, None, null_mut(), args.len());
-            if frame.is_null() {
-                return Err(stack_overflow(thread, function));
-            }
-            for arg in args {
-                (*frame).push(*arg);
-            }
-            let result = (func.callback)(thread, (*frame).slice(args.len()));
-            thread.vm_stack.leave_frame();
-            return result;
-        }
-    } else {
-        let env = pre_call(thread, function, args)?;
-        unsafe {
-            let (_, closure) = if function.is_cell::<ScmPrototype>() {
-                (function.downcast::<ScmPrototype>(), None)
-            } else {
-                (
-                    function.downcast::<Closure>().prototype,
-                    Some(function.downcast::<Closure>()),
-                )
-            };
-            let prev = thread.vm_stack.current_frame;
-            let frame = thread.vm_stack.make_frame(function, closure, env, 0);
-            (*frame).exit_on_return = true;
-            if frame.is_null() {
-                return Err(stack_overflow(thread, function));
-            }
-            setup_upvalues(thread, &mut *frame);
-            let result = vm_loop(thread);
+fn enter_function(
+    thread: &mut SchemeThread,
+    function: Value,
+    args: &[Value],
+) -> Result<Managed<ScmPrototype>, Value> {
+    let env = pre_call(thread, function, args)?;
+    unsafe {
+        let (proto, closure) = if function.is_cell::<ScmPrototype>() {
+            (function.downcast::<ScmPrototype>(), None)
+        } else {
+            (
+                function.downcast::<Closure>().prototype,
+                Some(function.downcast::<Closure>()),
+            )
+        };
 
-            debug_assert_eq!(prev, thread.vm_stack.current_frame);
-            return result;
+        let frame = thread.vm_stack.make_frame(function, closure, env, 0);
+        (*frame).exit_on_return = true;
+        if frame.is_null() {
+            return Err(stack_overflow(thread, function));
         }
+        setup_upvalues(thread, &mut *frame);
+        Ok(proto)
+    }
+}
+
+pub fn apply(thread: &mut SchemeThread, function: Value, args: &[Value]) -> Result<Value, Value> {
+    let mut trampoline = false;
+    thread.trampoline_fn = function;
+    thread.trampoline_arguments.clear();
+    thread.trampoline_arguments.extend_from_slice(args);
+    // save frame that entered this trampoline
+    let _entry_frame = thread.vm_stack.current_frame;
+    loop {
+        let function = thread.trampoline_fn;
+        let argc = thread.trampoline_arguments.len();
+        let argv = thread.trampoline_arguments.as_ptr();
+        let args = unsafe { std::slice::from_raw_parts(argv, argc) };
+        if function.native_functionp() {
+            let func = function.downcast::<NativeFunction>();
+            unsafe {
+                let frame = thread
+                    .vm_stack
+                    .make_frame(function, None, null_mut(), args.len());
+                if frame.is_null() {
+                    return Err(stack_overflow(thread, function));
+                }
+                for arg in args {
+                    (*frame).push(*arg);
+                }
+                let result = (func.callback)(thread, (*frame).slice(args.len()));
+                thread.vm_stack.leave_frame();
+                return result;
+            }
+        } else {
+            let proto = enter_function(thread, function, args)?;
+            let code = proto.jit_code.load(std::sync::atomic::Ordering::Relaxed);
+
+            if code.is_null() {
+                if proto
+                    .n_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    >= thread.runtime.inner().hotness
+                {
+                    let inner = thread.runtime.inner();
+                    let code = inner.jit.compile(proto, inner.dump_jit);
+                    proto
+                        .jit_code
+                        .store(code as *mut u8, std::sync::atomic::Ordering::Release);
+
+                    let mut trampoline = Trampoline::Return;
+                    let fun = unsafe { std::mem::transmute::<_, JITSig>(code) };
+
+                    let val = fun(thread, &mut trampoline);
+                    unsafe {
+                        thread.vm_stack.leave_frame();
+                    }
+                    match trampoline {
+                        Trampoline::Return => return Ok(val),
+                        Trampoline::Exception => return Err(val),
+                        Trampoline::Call => {
+                            continue;
+                        }
+                    }
+                } else {
+                    let result = unsafe { vm_loop(thread, &mut trampoline) };
+                    return result;
+                }
+            } else {
+                let mut trampoline = Trampoline::Return;
+                let fun = unsafe { std::mem::transmute::<_, JITSig>(code) };
+
+                let val = fun(thread, &mut trampoline);
+                unsafe {
+                    thread.vm_stack.leave_frame();
+                }
+                match trampoline {
+                    Trampoline::Return => return Ok(val),
+                    Trampoline::Exception => return Err(val),
+                    Trampoline::Call => {
+                        continue;
+                    }
+                }
+            }
+        };
     }
 }

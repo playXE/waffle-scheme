@@ -1,8 +1,41 @@
+use super::{defun, defun_with_transformer, value::Value, SchemeThread};
+use crate::{init::wrong_type_argument, method_jit::lir::*, method_jit::lower::FunctionLowerer};
 use num::traits::Inv;
+pub fn subr_num_add_inline(
+    gen: &mut FunctionLowerer,
+    slowpath: &mut dyn FnMut(&mut FunctionLowerer) -> u32,
+    argc: u16,
+) -> bool {
+    if argc != 2 && argc != 1 && argc != 0 {
+        return false;
+    }
 
-use crate::init::wrong_type_argument;
+    if argc == 2 {
+        let slowpath = slowpath(gen);
+        gen.gen.emit(Lir::JumpNotInt(slowpath));
+        let next = gen.gen.new_block();
+        gen.gen.emit(Lir::Jump(next));
+        gen.gen.switch_to_block(next);
+        gen.gen.emit(Lir::Swap);
+        let next = gen.gen.new_block();
+        gen.gen.emit(Lir::JumpNotInt(slowpath));
+        gen.gen.emit(Lir::Jump(next));
+        gen.gen.switch_to_block(next);
+        gen.gen.emit(Lir::Swap);
+        gen.gen.emit(Lir::IBin(Bin::Add));
+    } else if argc == 1 {
+        let slowpath = slowpath(gen);
+        gen.gen.emit(Lir::JumpNotInt(slowpath));
+        let next = gen.gen.new_block();
+        gen.gen.switch_to_block(next);
+    } else if argc == 0 {
+        gen.gen.emit(Lir::Int32(0));
+    } else {
+        unreachable!();
+    }
 
-use super::{defun, value::Value, SchemeThread};
+    true
+}
 
 pub fn subr_num_add(thread: &mut SchemeThread, args: &[Value]) -> Result<Value, Value> {
     if args.len() == 2 {
@@ -456,7 +489,15 @@ pub fn subr_num_nan_pred(thread: &mut SchemeThread, args: &[Value]) -> Result<Va
 }
 
 pub(crate) fn init(thread: &mut SchemeThread) {
-    defun(thread, "+", subr_num_add, 0, true, false);
+    defun_with_transformer(
+        thread,
+        "+",
+        subr_num_add,
+        0,
+        true,
+        false,
+        subr_num_add_inline,
+    );
     defun(thread, "-", subr_num_sub, 0, true, false);
     defun(thread, "/", subr_num_div, 1, true, false);
     defun(thread, "*", subr_num_mul, 0, true, false);

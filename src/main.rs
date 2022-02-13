@@ -66,42 +66,13 @@ fn main() {
     for path in opts.module_search_paths.iter() {
         add_module_search_path(&mut thread, path);
     }
-    /*
-    let mut cc = Compiler::new(&mut thread, None, None, 0);
-    let sexp = lexpr::from_str("(+ 1 2)").unwrap();
+
+    /*let mut cc = Compiler::new(&mut thread, None, None, 0);
+    let sexp = lexpr::from_str("1").unwrap();
     let _ = cc.compile(&mut thread, &sexp, false);
     let proto = cc.end(&mut thread, 0, false);
-
-    let mut jit = Jit::new();
-
-    let code = jit.compile(proto);
-
-    let fun = unsafe {
-        std::mem::transmute::<
-            _,
-            extern "C" fn(
-                &mut SchemeThread,
-                Managed<ScmPrototype>,
-                Option<Managed<Closure>>,
-                usize,
-                *mut Value,
-                *mut bool,
-                *mut bool,
-            ) -> Value,
-        >(code)
-    };
-    let mut did_throw = false;
-
-    let val = fun(
-        &mut thread,
-        proto,
-        None,
-        0,
-        null_mut(),
-        &mut false,
-        &mut did_throw,
-    );
-    println!("{} {}", did_throw, val);*/
+    let mut jit = MethodJIT::new();
+    let code = jit.compile(proto);*/
 
     if let Some(ref file) = opts.filename {
         match load_file(&mut thread, file, Value::new(Null)) {

@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use crate::{Heap, *};
+use crate::{method_jit::lower::FunctionLowerer, Heap, *};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
 use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 
@@ -632,13 +632,15 @@ unsafe impl Finalize for Closure {}
 impl Collectable for Closure {}
 
 pub type NativeCallback = fn(&mut SchemeThread, args: &[Value]) -> Result<Value, Value>;
-
+pub type NativeTransformer =
+    fn(&mut FunctionLowerer, slow: &mut dyn FnMut(&mut FunctionLowerer) -> u32, u16) -> bool;
 #[allow(dead_code)]
 pub struct NativeFunction {
     pub(crate) callback: NativeCallback,
     pub(crate) arguments: usize,
     pub(crate) name: Value,
     pub(crate) variable_arity: bool,
+    pub(crate) transformer: Option<NativeTransformer>,
 }
 
 pub struct Macro {

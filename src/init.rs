@@ -1,9 +1,12 @@
+use comet::api::{Collectable, Finalize, Trace};
+
 use crate::runtime::{
-    cons, define, defun, make_box, make_exception, make_list, make_string, make_vector,
+    cons, define, defun, defun_with_transformer, make_box, make_exception, make_list, make_string,
+    make_vector,
     value::{Null, ScmBox, ScmSymbol, ScmVector, Value},
     SchemeThread,
 };
-use std::sync::atomic::AtomicU64;
+use std::{sync::atomic::AtomicU64, time::Instant};
 
 pub(crate) fn enable_core(thread: &mut SchemeThread) {
     init_core(thread);
@@ -51,7 +54,7 @@ pub fn wrong_type_argument(
 fn init_core(thread: &mut SchemeThread) {
     crate::runtime::subr_arith::init(thread);
     crate::runtime::threading::init(thread);
-    defun(
+    defun_with_transformer(
         thread,
         "car",
         |thread, args| {
@@ -63,6 +66,7 @@ fn init_core(thread: &mut SchemeThread) {
         1,
         false,
         false,
+        crate::runtime::subr_inline::car_inline,
     );
     defun(
         thread,
@@ -807,4 +811,49 @@ fn init_core(thread: &mut SchemeThread) {
         false,
         false,
     );
+    defun(
+        thread,
+        "time/now",
+        |thread, _| {
+            let mut val = thread
+                .mutator
+                .allocate(ScmInstant(None), comet::gc_base::AllocationSpace::New);
+            val.0 = Some(Instant::now());
+            Ok(Value::new(val))
+        },
+        0,
+        false,
+        false,
+    );
+    defun(
+        thread,
+        "time/elapsed",
+        |thread, args| {
+            let arg = args[0];
+            if !arg.is_cell::<ScmInstant>() {
+                return Err(wrong_type_argument(
+                    thread,
+                    "time/elapsed",
+                    "instant",
+                    arg,
+                    1,
+                ));
+            }
+            let t = arg.downcast::<ScmInstant>().0.unwrap().elapsed().as_nanos();
+            if t as i32 as u128 == t {
+                return Ok(Value::new(t as i32));
+            } else {
+                return Ok(Value::new(t as f64));
+            }
+        },
+        1,
+        false,
+        false,
+    );
 }
+
+struct ScmInstant(Option<Instant>);
+
+unsafe impl Trace for ScmInstant {}
+unsafe impl Finalize for ScmInstant {}
+impl Collectable for ScmInstant {}

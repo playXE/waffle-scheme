@@ -1,13 +1,15 @@
 use self::{
     value::{
-        Macro, NativeCallback, NativeFunction, Null, ScmBignum, ScmBlob, ScmBox, ScmComplex,
-        ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector, Value,
+        Macro, NativeCallback, NativeFunction, NativeTransformer, Null, ScmBignum, ScmBlob, ScmBox,
+        ScmComplex, ScmCons, ScmException, ScmRational, ScmString, ScmSymbol, ScmTable, ScmVector,
+        Upvalue, Value,
     },
     vm::VMStack,
 };
 use crate::{
     compiler::{make_env, Compiler},
     init::enable_core,
+    method_jit::MethodJIT,
     runtime::value::Closure,
     Heap, Managed,
 };
@@ -29,6 +31,7 @@ use std::{
 pub mod arith;
 //pub mod interpreter;
 pub mod subr_arith;
+pub mod subr_inline;
 pub mod threading;
 pub mod value;
 pub mod vm;
@@ -101,8 +104,10 @@ pub(crate) struct RtInner {
     pub(crate) threads: Vec<SchemeThreadRef>,
     pub(crate) global_lock: Lock,
     pub(crate) dump_bytecode: bool,
-
+    pub(crate) dump_jit: bool,
     pub(crate) hotness: usize,
+    pub(crate) jit: MethodJIT,
+    pub(crate) jit_lock: Lock,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -157,7 +162,7 @@ impl Runtime {
     pub fn new(
         heap: MutatorRef<Heap>,
         dump_bytecode: bool,
-        _dump_jit: bool,
+        dump_jit: bool,
         hotness: usize,
     ) -> SchemeThreadRef {
         let rt = Runtime {
@@ -166,6 +171,7 @@ impl Runtime {
                 user_module: None,
                 symbol_table: None,
                 globals: vec![],
+                dump_jit,
 
                 qualified_imports: vec![],
                 module_search_paths: vec![],
@@ -176,6 +182,8 @@ impl Runtime {
 
                 global_lock: Lock::INIT,
                 hotness,
+                jit: MethodJIT::new(),
+                jit_lock: Lock::INIT,
             })))
             .unwrap(),
         };
@@ -470,12 +478,14 @@ pub fn make_native_function(
     ptr: NativeCallback,
     arguments: usize,
     variable_arity: bool,
+    transformer: Option<NativeTransformer>,
 ) -> Managed<NativeFunction> {
     thread.mutator.allocate(
         NativeFunction {
             arguments,
             variable_arity,
             callback: ptr,
+            transformer,
             name,
         },
         AllocationSpace::New,
@@ -526,7 +536,46 @@ pub fn defun(
     mutable: bool,
 ) {
     let name_ = make_string(thread, name);
-    let fun = make_native_function(thread, Value::new(name_), ptr, arguments, variable_arity);
+    let fun = make_native_function(
+        thread,
+        Value::new(name_),
+        ptr,
+        arguments,
+        variable_arity,
+        None,
+    );
+    let name = make_symbol(thread, name);
+    let core = thread.runtime.inner().core_module;
+    env_define(
+        thread,
+        core.unwrap(),
+        Value::new(name),
+        Value::new(fun),
+        true,
+    );
+    let mut qualified_name = env_qualify_name(thread, core.unwrap(), Value::new(name));
+    qualified_name.value = Value::new(fun);
+    qualified_name.mutable = mutable;
+}
+
+pub fn defun_with_transformer(
+    thread: &mut SchemeThread,
+    name: &str,
+    ptr: NativeCallback,
+    arguments: usize,
+    variable_arity: bool,
+    mutable: bool,
+    transformer: NativeTransformer,
+) {
+    let name_ = make_string(thread, name);
+    let fun = make_native_function(
+        thread,
+        Value::new(name_),
+        ptr,
+        arguments,
+        variable_arity,
+        Some(transformer),
+    );
     let name = make_symbol(thread, name);
     let core = thread.runtime.inner().core_module;
     env_define(
@@ -890,6 +939,13 @@ impl std::fmt::Display for Value {
             )
         } else if self.tablep() {
             write!(f, "#<table at {:p}>", self.get_object())
+        } else if self.is_object() && self.get_object().is::<Upvalue>() {
+            write!(
+                f,
+                "#<upvalue {} at {:p}>",
+                self.upvalue(),
+                self.upvalue_addr()
+            )
         } else if self.is_object() {
             write!(f, "#<object at {:p}>", self.get_object())
         } else if self.is_native_value() {
