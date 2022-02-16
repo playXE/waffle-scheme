@@ -1,10 +1,11 @@
 use std::{
     hash::Hash,
+    mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use crate::{method_jit::lower::FunctionLowerer, Heap, *};
+use crate::{compiler::Op, method_jit::lower::FunctionLowerer, Heap, *};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
 use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 
@@ -600,6 +601,7 @@ pub struct ScmPrototype {
     pub(crate) variable_arity: bool,
     pub(crate) jit_code: AtomicPtr<u8>,
     pub(crate) n_calls: AtomicUsize,
+    pub(crate) entry_points: HashMap<u32, u32, Heap>,
 }
 
 /// A closure, aka a function which references free variables
@@ -1207,3 +1209,41 @@ unsafe impl Trace for ScmBignum {
 }
 unsafe impl Finalize for ScmBignum {}
 impl Collectable for ScmBignum {}
+
+pub fn print_bytecode(proto: Managed<ScmPrototype>) {
+    println!("bytecode for {}:", Value::new(proto));
+    println!(" constant pool: ");
+    for (i, c) in proto.constants.iter().enumerate() {
+        println!("  {:04}: {}", i, c);
+    }
+
+    let mut i = 0;
+    println!(" code:");
+    let ncode = proto.code.len() / size_of::<Op>();
+    while i < ncode {
+        let op = unsafe { proto.code.as_ptr().cast::<Op>().add(i).read() };
+        i += 1;
+        print!("  {:04}: ", i - 1);
+        match op {
+            Op::Apply(nargs) => println!("apply {}", nargs),
+            Op::TailApply(nargs) => println!("tail-apply {}", nargs),
+            Op::CloseOver => println!("close-over"),
+            Op::GlobalGet => println!("global.get"),
+            Op::GlobalSet => println!("global.set"),
+            Op::LocalGet(x) => println!("local.get {}", x),
+            Op::LocalSet(x) => println!("local.set {}", x),
+            Op::UpvalueGet(x) => println!("upvalue.get {}", x),
+            Op::UpvalueSet(x) => println!("upvalue.set {}", x),
+            Op::Jump(x) => println!("jump {:04}", x),
+            Op::JumpIfFalse(x) => println!("jump-if-false {:04}", x),
+            Op::Pop => println!("pop"),
+            Op::PushInt(x) => println!("push.i32 {}", x),
+            Op::PushConstant(x) => println!("push.const {} ; {}", x, proto.constants[x as usize]),
+            Op::PushFalse => println!("push.false"),
+            Op::PushTrue => println!("push.true"),
+            Op::PushNull => println!("push.null"),
+            Op::Return => println!("return"),
+            Op::LoopHint => println!("loophint"),
+        }
+    }
+}

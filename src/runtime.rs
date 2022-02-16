@@ -7,11 +7,8 @@ use self::{
     vm::VMStack,
 };
 use crate::{
-    compiler::{make_env, Compiler},
-    init::enable_core,
-    method_jit::MethodJIT,
-    runtime::value::Closure,
-    Heap, Managed,
+    compiler::make_env, init::enable_core, method_jit::MethodJIT, runtime::value::Closure, Heap,
+    Managed,
 };
 use comet::{
     api::Trace,
@@ -715,7 +712,10 @@ pub fn load_file(
     };
     let stack = thread.mutator.shadow_stack();
     let mut parser = lexpr::Parser::from_str(&file);
-    letroot!(cc = stack, Compiler::new(thread, None, None, 0));
+    letroot!(
+        cc = stack,
+        crate::compiler::Compiler::new(thread, None, None, 0,)
+    );
     if module_name.stringp() {
         cc.enter_module(thread, module_name)?;
     } else {
@@ -738,7 +738,7 @@ pub fn load_file(
 
         let p = cc.end(thread, 0, false);
 
-        x = vm::apply(thread, Value::new(p), &[])?;
+        x = crate::runtime::vm::apply(thread, Value::new(p), &[])?;
         cc.clear();
     }
 

@@ -1,4 +1,4 @@
-#![feature(arbitrary_self_types, vec_retain_mut)]
+#![feature(arbitrary_self_types, vec_retain_mut, core_intrinsics)]
 use comet::api::{Collectable, Gc, HeapObjectHeader};
 use runtime::NanBoxedDecoder;
 
@@ -37,3 +37,4 @@ pub mod init;
 pub mod method_jit;
 pub mod runtime;
 pub mod tracing_jit;
+pub mod vm;

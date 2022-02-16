@@ -89,18 +89,6 @@
 			(cond ,@rest))))
 			
 
-(defmacro while (condition . body)
- (let ((loop (gensym)))
-    `(letrec ((,loop (lambda () 
-        (if ,condition
-            (begin 
-                ,@body 
-                (,loop)
-            )
-            '()
-    )))) (,loop))
- )
-)
 
 (defmacro for (test . body)
     (let ((varname (car test)) 

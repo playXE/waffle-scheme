@@ -11,22 +11,17 @@ pub fn subr_num_add_inline(
     }
 
     if argc == 2 {
+        //let next = gen.gen.new_block();
         let slowpath = slowpath(gen);
-        gen.gen.emit(Lir::JumpNotInt(slowpath));
-        let next = gen.gen.new_block();
-        gen.gen.emit(Lir::Jump(next));
-        gen.gen.switch_to_block(next);
-        gen.gen.emit(Lir::Swap);
-        let next = gen.gen.new_block();
-        gen.gen.emit(Lir::JumpNotInt(slowpath));
-        gen.gen.emit(Lir::Jump(next));
-        gen.gen.switch_to_block(next);
-        gen.gen.emit(Lir::Swap);
+        gen.gen.emit(Lir::JumpBothNotInt(slowpath));
+        // gen.gen.emit(Lir::Jump(next));
+        // gen.gen.switch_to_block(next);
         gen.gen.emit(Lir::IBin(Bin::Add));
     } else if argc == 1 {
         let slowpath = slowpath(gen);
         gen.gen.emit(Lir::JumpNotInt(slowpath));
         let next = gen.gen.new_block();
+        gen.gen.emit(Lir::Jump(next));
         gen.gen.switch_to_block(next);
     } else if argc == 0 {
         gen.gen.emit(Lir::Int32(0));
@@ -36,7 +31,21 @@ pub fn subr_num_add_inline(
 
     true
 }
+pub fn subr_num_lt_inline(
+    gen: &mut FunctionLowerer,
+    slowpath: &mut dyn FnMut(&mut FunctionLowerer) -> u32,
+    argc: u16,
+) -> bool {
+    if argc != 2 {
+        return false;
+    }
 
+    let slowpath = slowpath(gen);
+    gen.gen.emit(Lir::JumpBothNotInt(slowpath));
+    gen.gen.emit(Lir::IBin(Bin::Lt));
+
+    true
+}
 pub fn subr_num_add(thread: &mut SchemeThread, args: &[Value]) -> Result<Value, Value> {
     if args.len() == 2 {
         if args[0].fixnump() && args[1].fixnump() {
@@ -502,7 +511,7 @@ pub(crate) fn init(thread: &mut SchemeThread) {
     defun(thread, "/", subr_num_div, 1, true, false);
     defun(thread, "*", subr_num_mul, 0, true, false);
     defun(thread, "=", subr_num_eq, 1, true, false);
-    defun(thread, "<", subr_num_lt, 1, true, false);
+    defun_with_transformer(thread, "<", subr_num_lt, 1, true, false, subr_num_lt_inline);
     defun(thread, ">", subr_num_gt, 1, true, false);
     defun(thread, ">=", subr_num_ge, 1, true, false);
     defun(thread, "<=", subr_num_le, 1, true, false);

@@ -122,7 +122,7 @@ fn repl(thread: &mut SchemeThread) {
                 }
                 let p = cc.end(thread, 0, false);
                 cc.clear();
-                match waffle::runtime::vm::apply(thread, Value::new(p), &[]) {
+                match waffle::vm::apply(thread, Value::new(p), &[]) {
                     Ok(x) => {
                         println!("{}", x);
                     }

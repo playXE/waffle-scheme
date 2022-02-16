@@ -14,6 +14,7 @@ use crate::{
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Lir {
+    Pop,
     Car,
     Cdr,
     VectorRef,
@@ -38,7 +39,8 @@ pub enum Lir {
     GlobalSet(u32),
     IsCell(u32),
     JumpNotInt(u32),
-    JumpNoFloat(u32),
+    JumpBothNotInt(u32),
+    JumpNotFloat(u32),
     JumpNotNull(u32),
     JumpNotUndefined(u32),
     JumpNotObject(u32),
@@ -90,8 +92,9 @@ impl std::fmt::Display for Bin {
 }
 
 pub struct BasicBlock {
-    id: u32,
-    code: Vec<Lir>,
+    pub id: u32,
+    pub entrypoint: Option<u32>,
+    pub code: Vec<Lir>,
 }
 
 pub struct LIRGen {
@@ -121,7 +124,11 @@ impl LIRGen {
     }
     pub fn new_block(&mut self) -> u32 {
         let id = self.blocks.len() as u32;
-        self.blocks.push(BasicBlock { id, code: vec![] });
+        self.blocks.push(BasicBlock {
+            id,
+            code: vec![],
+            entrypoint: None,
+        });
 
         id
     }
@@ -225,7 +232,7 @@ use comet_extra::alloc::vector::Vector;
 use cranelift::{
     codegen::ir::{self, types, FuncRef, InstBuilder},
     frontend::FunctionBuilder,
-    prelude::{IntCC, Variable},
+    prelude::{IntCC, JumpTableData, Variable},
 };
 use cranelift::{codegen::isa, prelude::MemFlags};
 use cranelift_jit::JITModule;
@@ -246,7 +253,8 @@ pub struct LIRCompiler<'a> {
     pub module: &'a mut JITModule,
     pub bp: ir::Value,
     pub frame: ir::Value,
-    pub si: Variable,
+    pub sp: Variable,
+    pub stack: Vec<ir::Value>,
     pub env: ir::Value,
     pub blocks: BTreeMap<u32, ir::Block>,
     pub jit_trampoline: FuncRef,
@@ -257,10 +265,36 @@ pub struct LIRCompiler<'a> {
 impl<'a> LIRCompiler<'a> {
     pub fn translate(
         &mut self,
-        proto: Managed<ScmPrototype>,
+        mut proto: Managed<ScmPrototype>,
         thread: ir::Value,
         trampoline: ir::Value,
+        entry: ir::Value,
     ) {
+        let mut jump_table = JumpTableData::new();
+        // map LIR blocks to Cranelift IR blocks
+        let mut jump_blocks = BTreeMap::new();
+
+        for (_, block) in self.gen.blocks.iter().enumerate() {
+            let bb = self.builder.create_block();
+            self.blocks.insert(block.id, bb);
+            if let Some(ip) = block.entrypoint {
+                let entry = proto.entry_points.get_mut(&ip).unwrap();
+                *entry = jump_table.len() as u32;
+                jump_table.push_entry(bb);
+            }
+            for node in block.code.iter() {
+                match node {
+                    Lir::JumpIfFalse(_)
+                    | Lir::JumpNotInt(_)
+                    | Lir::JumpBothNotInt(_)
+                    | Lir::JumpNotCellOf(_, _) => {
+                        let jmp_bb = self.builder.create_block();
+                        jump_blocks.insert(block.id, jmp_bb);
+                    }
+                    _ => (),
+                }
+            }
+        }
         // Setup variables
         let vm_stack_off = offset_of!(SchemeThread, vm_stack);
         let frame_off = offset_of!(VMStack, current_frame);
@@ -284,24 +318,21 @@ impl<'a> LIRCompiler<'a> {
         );
         self.env = locals;
         self.bp = bp;
+        self.builder.def_var(self.sp, bp);
         self.frame = frame;
-        let si = self.builder.ins().iconst(types::I64, 0);
-        self.builder.def_var(self.si, si);
         let closure = self.builder.ins().load(
             types::I64,
             MemFlags::new(),
             frame,
             offset_of!(CallFrame, closure) as i32,
         );
-        // map LIR blocks to Cranelift IR blocks
-        //
-        // note that first block with id 0 is entry block and it is already in blocks map.
-        for block in self.gen.blocks.iter().skip(1) {
-            let bb = self.builder.create_block();
-            self.blocks.insert(block.id, bb);
-        }
+        let entry_block = self.blocks.get(&0).copied().unwrap();
+        let jump_table = self.builder.create_jump_table(jump_table);
+        // todo: jump to block that will throw exception that entry point is not found
+        self.builder.ins().br_table(entry, entry_block, jump_table);
         let return_block = self.builder.create_block();
         self.builder.append_block_param(return_block, types::I64);
+
         // emit Cranelift IR from LIR
         for lir_block in self.gen.blocks.iter() {
             let block = self.blocks.get(&lir_block.id).copied().unwrap();
@@ -311,6 +342,11 @@ impl<'a> LIRCompiler<'a> {
 
             for node in lir_block.code.iter() {
                 match node {
+                    Lir::Jump(x) => {
+                        let target = self.blocks.get(x).copied().unwrap();
+
+                        self.builder.ins().jump(target, &[]);
+                    }
                     Lir::Swap => {
                         let x = self.pop();
                         let y = self.pop();
@@ -334,6 +370,7 @@ impl<'a> LIRCompiler<'a> {
                         let value = self.top();
                         let is_pointer = self.is_pointer(value);
                         let is_pointer_block = self.builder.create_block();
+
                         self.builder.ins().brz(is_pointer, target, &[]);
                         self.builder.ins().jump(is_pointer_block, &[]);
                         self.builder.switch_to_block(is_pointer_block);
@@ -352,24 +389,43 @@ impl<'a> LIRCompiler<'a> {
                         self.builder.ins().jump(next_block, &[]);
                         self.builder.switch_to_block(next_block);
                     }
+                    Lir::Pop => {
+                        self.pop();
+                    }
+                    Lir::JumpBothNotInt(target) => {
+                        let x = self.stack_at(-1);
+                        let y = self.stack_at(-2);
+                        let xi = self.is_int(x);
+                        let yi = self.is_int(y);
+                        let cond = self.builder.ins().band(xi, yi);
+                        let target = self.blocks.get(target).copied().unwrap();
+                        self.builder.ins().brz(cond, target, &[]);
+
+                        let next = jump_blocks.get(&lir_block.id).copied().unwrap();
+                        self.builder.ins().jump(next, &[]);
+                        self.builder.switch_to_block(next);
+                        //self.builder.seal_block(next);
+                        //self.builder.seal_block(target);
+                    }
                     Lir::JumpNotInt(x) => {
                         let value = self.top();
                         let is_int = self.is_int(value);
                         let target = self.blocks.get(x).copied().unwrap();
                         self.builder.ins().brz(is_int, target, &[]);
-                        let next = self.builder.create_block();
+                        let next = jump_blocks.get(&lir_block.id).copied().unwrap();
                         self.builder.ins().jump(next, &[]);
                         self.builder.switch_to_block(next);
                     }
-                    Lir::Jump(x) => {
-                        let target = self.blocks.get(x).copied().unwrap();
-                        self.builder.ins().jump(target, &[]);
-                    }
+
                     Lir::JumpIfFalse(x) => {
                         let target = self.blocks.get(x).copied().unwrap();
                         let value = self.pop();
                         let is_falsey = self.is_false_or_null(value);
-                        self.builder.ins().brnz(is_falsey, target, &[]);
+
+                        self.builder.ins().brnz(is_falsey, target, &self.stack);
+                        let next = jump_blocks.get(&lir_block.id).copied().unwrap();
+                        self.builder.ins().jump(next, &[]);
+                        self.builder.switch_to_block(next);
                     }
                     Lir::LocalGet(at) => {
                         let value = self.env_load(*at);
@@ -390,10 +446,10 @@ impl<'a> LIRCompiler<'a> {
                             .iconst(types::I64, Value::new(Undefined).get_raw() as i64);
                         self.builder.ins().return_(&[value]);
                     }
-                    Lir::Trampoline(nargs) => {
+                    Lir::Trampoline(nargs_) => {
                         let func = self.pop();
                         self.update_frame();
-                        let nargs = self.builder.ins().iconst(types::I32, *nargs as i64);
+                        let nargs = self.builder.ins().iconst(types::I32, *nargs_ as i64);
                         self.builder
                             .ins()
                             .call(self.jit_trampoline, &[thread, self.frame, func, nargs]);
@@ -402,16 +458,21 @@ impl<'a> LIRCompiler<'a> {
                             .ins()
                             .iconst(types::I8, Trampoline::Call as i64);
                         self.builder.ins().store(MemFlags::new(), t, trampoline, 0);
+                        self.zero_frame();
+                        for _ in 0..*nargs_ {
+                            self.pop();
+                        }
                     }
                     Lir::CloseOver(x) => {
                         let proto = proto.constants[*x as usize].get_raw();
                         let x = self.builder.ins().iconst(types::I64, proto as i64);
-                        self.push(x);
-                        self.update_frame();
-                        self.builder
+
+                        let call = self
+                            .builder
                             .ins()
-                            .call(self.close_over, &[thread, self.frame]);
-                        self.load_frame();
+                            .call(self.close_over, &[thread, self.frame, x]);
+                        let closure = self.builder.inst_results(call)[0];
+                        self.push(closure);
                     }
                     Lir::Constant(x) => {
                         let constant = proto.constants[*x as usize].get_raw();
@@ -596,7 +657,10 @@ impl<'a> LIRCompiler<'a> {
                             self.jit_apply,
                             &[thread, self.frame, func, nargs, trampoline],
                         );
-                        self.load_frame();
+                        self.zero_frame();
+                        for _ in 0..*x {
+                            self.pop();
+                        }
 
                         let value = self.builder.inst_results(call)[0];
                         let result =
@@ -620,14 +684,27 @@ impl<'a> LIRCompiler<'a> {
                         self.push(value);
                     }
                     Lir::IBin(op) => {
-                        let x = self.pop();
                         let y = self.pop();
+                        let x = self.pop();
                         let xi = self.get_int32(x);
                         let yi = self.get_int32(y);
                         let z = match op {
                             Bin::Add => {
                                 let val = self.builder.ins().iadd(xi, yi);
                                 self.box_wtag(val, INT32_TAG)
+                            }
+                            Bin::Lt => {
+                                let val = self.builder.ins().icmp(IntCC::SignedLessThan, xi, yi);
+                                let t = self
+                                    .builder
+                                    .ins()
+                                    .iconst(types::I64, Value::new(true).get_raw() as i64);
+                                let f = self
+                                    .builder
+                                    .ins()
+                                    .iconst(types::I64, Value::new(false).get_raw() as i64);
+                                let val = self.builder.ins().select(val, t, f);
+                                val
                             }
                             _ => todo!(),
                         };
@@ -642,14 +719,33 @@ impl<'a> LIRCompiler<'a> {
         self.builder.ins().return_(&[val]);
     }
 
+    /// Restores VM stack before invoking VM primitive.
     pub fn update_frame(&mut self) {
-        let si = self.builder.use_var(self.si);
+        let sp = self.builder.use_var(self.sp);
+        let bp = self.bp;
+
+        let off = self.builder.ins().isub(sp, bp);
+        let index = self.builder.ins().udiv_imm(off, 8);
+        self.builder.ins().store(
+            MemFlags::new(),
+            index,
+            self.frame,
+            offset_of!(CallFrame, si) as i32,
+        );
+
+        /*let si = self.builder.ins().iconst(types::I64, self.si as i64);
         self.builder.ins().store(
             MemFlags::new(),
             si,
             self.frame,
             offset_of!(CallFrame, si) as i32,
         );
+
+        for (i, val) in self.stack.iter().copied().enumerate() {
+            self.builder
+                .ins()
+                .store(MemFlags::new(), val, self.bp, i as i32 * 8);
+        }*/
     }
     pub fn get_int32(&mut self, val: ir::Value) -> ir::Value {
         self.builder.ins().ireduce(types::I32, val)
@@ -678,6 +774,15 @@ impl<'a> LIRCompiler<'a> {
             .ins()
             .icmp_imm(IntCC::Equal, tag, INT32_TAG as i64)
     }
+    pub fn zero_frame(&mut self) {
+        let si = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().store(
+            MemFlags::new(),
+            si,
+            self.frame,
+            offset_of!(CallFrame, si) as i32,
+        );
+    }
     pub fn load_frame(&mut self) {
         let si = self.builder.ins().load(
             types::I64,
@@ -685,7 +790,9 @@ impl<'a> LIRCompiler<'a> {
             self.frame,
             offset_of!(CallFrame, si) as i32,
         );
-        self.builder.def_var(self.si, si);
+        let off = self.builder.ins().imul_imm(si, 8);
+        let sp = self.builder.ins().iadd(self.bp, off);
+        self.builder.def_var(self.sp, sp);
     }
 
     pub fn is_false_or_null(&mut self, val: ir::Value) -> ir::Value {
@@ -703,7 +810,27 @@ impl<'a> LIRCompiler<'a> {
     }
 
     pub fn pop_or_undef(&mut self) -> ir::Value {
-        let mut si = self.builder.use_var(self.si);
+        let bp = self.bp;
+        let sp = self.builder.use_var(self.sp);
+
+        let merge = self.builder.create_block();
+        let neq = self.builder.create_block();
+        self.builder.append_block_param(merge, types::I64);
+        let undef = self
+            .builder
+            .ins()
+            .iconst(types::I64, Value::new(Undefined).get_raw() as i64);
+        self.builder
+            .ins()
+            .br_icmp(IntCC::Equal, sp, bp, merge, &[undef]);
+        self.builder.ins().jump(neq, &[]);
+        self.builder.switch_to_block(neq);
+        let val = self.pop();
+        self.builder.ins().jump(merge, &[val]);
+        self.builder.switch_to_block(merge);
+        self.builder.block_params(merge)[0]
+
+        /*let mut si = self.builder.use_var(self.si);
         let osi = si;
         let if_zero = self.builder.create_block();
         let if_nzero = self.builder.create_block();
@@ -730,26 +857,43 @@ impl<'a> LIRCompiler<'a> {
         let si = self.builder.block_params(merge)[1];
         let val = self.builder.block_params(merge)[0];
         self.builder.def_var(self.si, si);
-        val
+        val*/
+        /* match self.stack.pop() {
+            Some(val) => {
+                self.si -= 1;
+                val
+            }
+            None => self
+                .builder
+                .ins()
+                .iconst(types::I64, Value::new(Undefined).get_raw() as i64),
+        }*/
     }
     pub fn top(&mut self) -> ir::Value {
-        let mut si = self.builder.use_var(self.si);
+        /*let mut si = self.builder.use_var(self.si);
         let y = self.builder.ins().iconst(types::I64, 1);
         si = self.builder.ins().isub(si, y);
         let six = self.builder.ins().imul_imm(si, 8);
         let ptr = self.builder.ins().iadd(self.bp, six);
-        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)*/
+        let sp = self.builder.use_var(self.sp);
+        self.builder.ins().load(types::I64, MemFlags::new(), sp, -8)
     }
     pub fn stack_at(&mut self, x: i32) -> ir::Value {
-        let mut si = self.builder.use_var(self.si);
+        /*let mut si = self.builder.use_var(self.si);
 
         si = self.builder.ins().iadd_imm(si, x as i64);
         let six = self.builder.ins().imul_imm(si, 8);
         let ptr = self.builder.ins().iadd(self.bp, six);
-        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)
+        self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0)*/
+        let sp = self.builder.use_var(self.sp);
+
+        self.builder
+            .ins()
+            .load(types::I64, MemFlags::new(), sp, x * 8)
     }
     pub fn pop(&mut self) -> ir::Value {
-        let mut si = self.builder.use_var(self.si);
+        /*let mut si = self.builder.use_var(self.si);
         let y = self.builder.ins().iconst(types::I64, 1);
         si = self.builder.ins().isub(si, y);
         let six = self.builder.ins().imul_imm(si, 8);
@@ -757,16 +901,23 @@ impl<'a> LIRCompiler<'a> {
         let bp = self.bp;
         let ptr = self.builder.ins().iadd(bp, six);
         let value = self.builder.ins().load(types::I64, MemFlags::new(), ptr, 0);
-        value
+        value*/
+        // self.si -= 1;
+        let sp = self.builder.use_var(self.sp);
+        let new_sp = self.builder.ins().iadd_imm(sp, -8);
+        let val = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::new(), new_sp, 0);
+        self.builder.def_var(self.sp, new_sp);
+        val
     }
 
     pub fn push(&mut self, value: ir::Value) {
-        let mut si = self.builder.use_var(self.si);
-        let six = self.builder.ins().imul_imm(si, 8);
-        let ptr = self.builder.ins().iadd(self.bp, six);
-        self.builder.ins().store(MemFlags::new(), value, ptr, 0);
-        si = self.builder.ins().iadd_imm(si, 1);
-        self.builder.def_var(self.si, si);
+        let sp = self.builder.use_var(self.sp);
+        self.builder.ins().store(MemFlags::new(), value, sp, 0);
+        let sp = self.builder.ins().iadd_imm(sp, 8);
+        self.builder.def_var(self.sp, sp);
     }
 
     pub fn env_ptr(&mut self, at: u16) -> ir::Value {

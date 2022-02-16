@@ -1,4 +1,4 @@
-use std::{alloc::Layout, mem::size_of, ptr::null_mut};
+use std::{alloc::Layout, intrinsics::unlikely, mem::size_of, ptr::null_mut};
 
 use comet::api::{Trace, Visitor};
 use comet_extra::alloc::{array::Array, vector::Vector};
@@ -17,7 +17,7 @@ use super::{
     },
     Global, SchemeThread,
 };
-fn check_arguments(
+pub fn check_arguments(
     thread: &mut SchemeThread,
     argc: usize,
     prototype: Managed<ScmPrototype>,
@@ -165,10 +165,12 @@ impl VMStack {
             for i in 0..prototype.local_free_variable_count {
                 (*(*frame).upvalues.add(i as _)).upvalue_close();
             }
-            std::alloc::dealloc(
-                (*frame).env.cast(),
-                Layout::array::<Value>(prototype.locals as _).unwrap(),
-            );
+            if !(*frame).env.is_null() {
+                std::alloc::dealloc(
+                    (*frame).env.cast(),
+                    Layout::array::<Value>(prototype.locals as _).unwrap(),
+                );
+            }
         }
 
         self.cursor = (*frame).sp;
@@ -370,14 +372,41 @@ pub(crate) unsafe extern "C" fn close_over(thread: &mut SchemeThread, frame: &mu
     }
     frame.push(Value::new(c));
 }
-unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<Value, Value> {
+unsafe fn vm_loop(thread: &mut SchemeThread, trampoline: &mut Trampoline) -> Value {
     let mut frame = &mut *(*thread).vm_stack.current_frame;
-
+    let hotness = thread.runtime.inner().hotness;
     loop {
         let op = frame.fetch_opcode();
 
         frame.ip += 1;
         match op {
+            Op::LoopHint => {
+                let proto = frame.callee.downcast::<ScmPrototype>();
+                if unlikely(
+                    proto
+                        .n_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        >= hotness,
+                ) {
+                    let inner = thread.runtime;
+                    let inner = inner.inner();
+                    let code = inner.jit.compile(thread, proto, inner.dump_jit);
+                    proto
+                        .jit_code
+                        .store(code as *mut u8, std::sync::atomic::Ordering::Release);
+
+                    let fun = { std::mem::transmute::<_, JITSig>(code) };
+                    let entry = proto.entry_points.get(&(frame.ip as u32 - 1)).unwrap();
+                    if inner.dump_jit {
+                        eprintln!("JIT: trampoline to compiled code at {}", entry);
+                    }
+                    let val = fun(thread, trampoline, *entry as usize);
+
+                    thread.vm_stack.leave_frame();
+
+                    return val;
+                }
+            }
             Op::PushConstant(c) => {
                 let constant = frame.fetch_constant(c);
                 frame.push(constant);
@@ -399,12 +428,14 @@ unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<V
                 };
                 let exit = thread.vm_stack.leave_frame();
 
-                if exit {
+                /*if exit {
                     return Ok(value);
                 }
 
                 frame = &mut *thread.vm_stack.current_frame;
-                frame.push(value);
+                frame.push(value);*/
+                debug_assert!(exit);
+                return value;
             }
 
             Op::LocalGet(at) => {
@@ -449,7 +480,7 @@ unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<V
             Op::TailApply(nargs) => {
                 let callee = frame.pop();
                 let args = frame.slice(nargs as _);
-                if callee.native_functionp() {
+                /* if callee.native_functionp() {
                     match apply(thread, callee, args) {
                         Ok(value) => match thread.vm_stack.leave_frame() {
                             true => {
@@ -518,16 +549,36 @@ unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<V
                         frame = &mut *new_frame;
                         continue;
                     }
-                }
+                }*/
+
+                thread.trampoline_fn = callee;
+                thread.trampoline_arguments.clear();
+                thread.trampoline_arguments.extend_from_slice(args);
+                assert!(thread.vm_stack.leave_frame());
+                *trampoline = Trampoline::Call;
+                return Value::new(Undefined);
             }
             Op::Apply(nargs) => {
                 let callee = frame.pop();
                 let args = frame.slice(nargs as _);
+                match apply(thread, callee, args) {
+                    Ok(val) => {
+                        for _ in 0..nargs {
+                            frame.pop();
+                        }
+                        frame.push(val);
+                    }
+                    Err(val) => {
+                        thread.vm_stack.leave_frame();
+                        *trampoline = Trampoline::Exception;
+                        return val;
+                    }
+                }
                 /*println!("apply {}", callee);
                 for arg in args {
                     println!("arg {}", arg);
                 }*/
-                if callee.native_functionp() {
+                /* if callee.native_functionp() {
                     match apply(thread, callee, args) {
                         Ok(value) => {
                             for _ in 0..nargs {
@@ -598,7 +649,7 @@ unsafe fn vm_loop(thread: &mut SchemeThread, _trampoline: &mut bool) -> Result<V
                         frame = &mut *new_frame;
                         continue;
                     }
-                }
+                }*/
             }
             Op::CloseOver => {
                 close_over(thread, frame);
@@ -614,6 +665,13 @@ pub fn stack_overflow(thread: &mut SchemeThread, f: Value) -> Value {
         format!("stack overflow while calling fucntion {}", f),
     );
     Value::new(make_exception(thread, tag, message, Value::new(Null)))
+}
+
+pub fn not_function(thread: &mut SchemeThread, func: Value) -> Value {
+    let tag = thread.runtime.global_symbol(super::Global::ScmEval);
+    let message = make_string(thread, format!("attempt to apply non-function {}", func));
+
+    return Value::new(make_exception(thread, tag, message, Value::new(Null)));
 }
 pub(crate) fn pre_call(
     thread: &mut SchemeThread,
@@ -704,7 +762,6 @@ fn enter_function(
 }
 
 pub fn apply(thread: &mut SchemeThread, function: Value, args: &[Value]) -> Result<Value, Value> {
-    let mut trampoline = false;
     thread.trampoline_fn = function;
     thread.trampoline_arguments.clear();
     thread.trampoline_arguments.extend_from_slice(args);
@@ -736,46 +793,54 @@ pub fn apply(thread: &mut SchemeThread, function: Value, args: &[Value]) -> Resu
             let code = proto.jit_code.load(std::sync::atomic::Ordering::Relaxed);
 
             if code.is_null() {
+                let mut trampoline = Trampoline::Return;
                 if proto
                     .n_calls
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     >= thread.runtime.inner().hotness
                 {
-                    let inner = thread.runtime.inner();
-                    let code = inner.jit.compile(proto, inner.dump_jit);
+                    let inner = thread.runtime;
+                    let inner = inner.inner();
+                    let code = inner.jit.compile(thread, proto, inner.dump_jit);
                     proto
                         .jit_code
                         .store(code as *mut u8, std::sync::atomic::Ordering::Release);
 
-                    let mut trampoline = Trampoline::Return;
                     let fun = unsafe { std::mem::transmute::<_, JITSig>(code) };
 
-                    let val = fun(thread, &mut trampoline);
+                    let val = fun(thread, &mut trampoline, 0);
                     unsafe {
                         thread.vm_stack.leave_frame();
                     }
                     match trampoline {
                         Trampoline::Return => return Ok(val),
                         Trampoline::Exception => return Err(val),
+                        Trampoline::Jit => continue,
                         Trampoline::Call => {
                             continue;
                         }
                     }
                 } else {
                     let result = unsafe { vm_loop(thread, &mut trampoline) };
-                    return result;
+                    match trampoline {
+                        Trampoline::Call => continue,
+                        Trampoline::Exception => return Err(result),
+                        Trampoline::Return => return Ok(result),
+                        Trampoline::Jit => continue,
+                    }
                 }
             } else {
                 let mut trampoline = Trampoline::Return;
                 let fun = unsafe { std::mem::transmute::<_, JITSig>(code) };
 
-                let val = fun(thread, &mut trampoline);
+                let val = fun(thread, &mut trampoline, 0);
                 unsafe {
                     thread.vm_stack.leave_frame();
                 }
                 match trampoline {
                     Trampoline::Return => return Ok(val),
                     Trampoline::Exception => return Err(val),
+                    Trampoline::Jit => continue,
                     Trampoline::Call => {
                         continue;
                     }

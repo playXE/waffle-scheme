@@ -4,6 +4,7 @@ use crate::compiler::Op;
 use crate::runtime::value::NativeFunction;
 use crate::runtime::value::ScmPrototype;
 use crate::runtime::value::ScmSymbol;
+use crate::runtime::SchemeThread;
 use crate::Managed;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -50,9 +51,11 @@ impl<'a> FunctionLowerer<'a> {
             .or_insert_with(|| self.gen.new_block())
     }
 
-    pub fn lower(&mut self, proto: Managed<ScmPrototype>) {
+    pub fn lower(&mut self, thread: &mut SchemeThread, mut proto: Managed<ScmPrototype>) {
         let mut i = 0;
         let entry = self.gen.new_block();
+        self.gen.blocks[entry as usize].entrypoint = Some(0);
+        proto.entry_points.insert(&mut thread.mutator, 0, 0);
         self.gen.switch_to_block(entry);
         while i < self.code.len() {
             if let Some(_cond) = self.targets.get(&(i as u32)).copied() {
@@ -65,6 +68,20 @@ impl<'a> FunctionLowerer<'a> {
             }
 
             match &self.code[i..] {
+                [Op::LoopHint, Op::Jump(target), ..] => {
+                    let entry_point = self.gen.new_block();
+                    self.gen.emit(Lir::Jump(entry_point));
+
+                    proto
+                        .entry_points
+                        .insert(&mut thread.mutator, i as u32, entry_point);
+                    self.gen.blocks[entry_point as usize].entrypoint = Some(i as u32);
+                    self.gen.switch_to_block(entry_point);
+
+                    let target = self.get_or_create_block(*target);
+                    self.gen.emit(Lir::Jump(target));
+                    i += 2;
+                }
                 [Op::PushConstant(x), Op::GlobalGet, Op::Apply(nargs), ..] => {
                     let sym = proto.constants[*x as usize].downcast::<ScmSymbol>();
                     if !sym.mutable && sym.value.native_functionp() {
@@ -214,6 +231,14 @@ impl<'a> FunctionLowerer<'a> {
                     self.gen.emit(Lir::Constant(*x));
                     i += 1;
                 }
+                [Op::Pop, ..] => {
+                    i += 1;
+                    self.gen.emit(Lir::Pop);
+                }
+                [Op::PushNull, ..] => {
+                    i += 1;
+                    self.gen.emit(Lir::N);
+                }
                 [x, ..] => todo!("{:?}", x),
                 x => todo!("{:?}", x),
             }
@@ -221,13 +246,13 @@ impl<'a> FunctionLowerer<'a> {
     }
 }
 
-pub fn lower(proto: Managed<ScmPrototype>) -> LIRGen {
+pub fn lower(thread: &mut SchemeThread, proto: Managed<ScmPrototype>) -> LIRGen {
     let code = proto.code.as_ptr();
     let code = unsafe {
         std::slice::from_raw_parts(code.cast::<Op>(), proto.code.len() / size_of::<Op>())
     };
     let mut lowerer = FunctionLowerer::new(code);
-    lowerer.lower(proto);
+    lowerer.lower(thread, proto);
 
     lowerer.gen
 }

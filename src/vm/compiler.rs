@@ -1,85 +1,208 @@
+use super::opcodes::Opcode;
+use crate::compiler::{Lookup, UpvalLoc};
+use crate::runtime::{
+    convert_module_name, env_define, env_globalp, env_qualify_name, lexpr_to_value, load_module,
+    make_blob, make_exception, make_string, make_symbol, make_table, make_vector, module_loaded,
+    register_module_,
+    value::{Macro, Null, ScmPrototype, Undefined},
+};
+use crate::{
+    compiler::FreeVariableInfo,
+    runtime::{
+        value::{ScmString, ScmTable, Value},
+        SchemeThread,
+    },
+    Heap, Managed,
+};
+use comet::api::Trace;
+use comet::letroot;
+use comet_extra::alloc::hash::HashMap;
+use comet_extra::alloc::vector::Vector;
 use std::{
     mem::size_of,
     ptr::null_mut,
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use comet::{api::Trace, letroot};
-use comet_extra::alloc::{hash::HashMap, vector::Vector};
-
-use crate::{
-    runtime::{
-        convert_module_name, env_define, env_globalp, env_qualify_name, lexpr_to_value,
-        load_module, make_blob, make_exception, make_string, make_symbol, make_table, make_vector,
-        module_loaded, register_module_,
-        value::{print_bytecode, Macro, Null, ScmPrototype, ScmString, ScmTable, Undefined, Value},
-        SchemeThread,
-    },
-    Heap, Managed,
-};
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
-pub enum Op {
-    PushInt(i32),
-    PushTrue,
-    PushFalse,
-    PushNull,
-    PushConstant(u32),
-    Pop,
-    GlobalSet,
-    GlobalGet,
-    LocalSet(u16),
-    LocalGet(u16),
-    UpvalueSet(u16),
-    UpvalueGet(u16),
-    CloseOver,
-    Return,
-    Apply(u16),
-    TailApply(u16),
-    JumpIfFalse(u32),
-    Jump(u32),
-    LoopHint,
+pub struct Code {
+    list: Vec<Opcode>,
+    maxtemp: u8,
+    ntemps: u8,
+    nlocals: u8,
+    error: bool,
+    state: [bool; 256],
+    skipclear: [bool; 256],
+    registers: Vec<u8>,
+    context: Vec<Vec<bool>>,
 }
 
-unsafe impl Trace for Op {}
-/// A structure describing the location of a free variable relative to the function it's being used in
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FreeVariableInfo {
-    /// The lexical location of the variable
-    pub lexical_level: usize,
-    pub lexical_index: usize,
-    /// The upvalue's index at runtime, either in the upvalues array of the
-    /// preceding function, or in the locals array of the currently executing
-    /// function
-    pub index: usize,
-    pub name: Value,
+impl Code {
+    pub fn clear(&mut self) {
+        *self = Self::new(0);
+    }
+    pub fn new(nlocals: usize) -> Self {
+        let mut this = Self {
+            list: vec![],
+            maxtemp: 0,
+            ntemps: 0,
+            nlocals: nlocals as _,
+            error: false,
+            state: [false; 256],
+            skipclear: [false; 256],
+            registers: vec![],
+            context: vec![],
+        };
+        for i in 0..nlocals {
+            this.state[i] = true;
+        }
+
+        this
+    }
+    pub fn emit(&mut self, op: Opcode) {
+        self.list.push(op);
+    }
+    pub fn push_context(&mut self) {
+        self.context.push(vec![false; 256]);
+    }
+    pub fn pop_context(&mut self) {
+        let ctx = self.context.pop().unwrap();
+        for i in 0..256 {
+            if ctx[i] {
+                self.state[i] = false;
+            }
+        }
+    }
+
+    pub fn register_protect_outside_context(&mut self, nreg: u8) -> bool {
+        if nreg < self.nlocals {
+            return true;
+        }
+        if !self.state[nreg as usize] {
+            return false;
+        }
+        let ctx = self.context.last_mut().unwrap();
+        ctx[nreg as usize] = false;
+        true
+    }
+
+    pub fn register_protect_in_context(&mut self, nreg: u8) {
+        let ctx = self.context.last_mut().unwrap();
+        ctx[nreg as usize] = true;
+    }
+
+    pub fn register_new(&mut self) -> Option<u8> {
+        for i in 0..256 {
+            if !self.state[i] {
+                self.state[i] = true;
+                return Some(i as u8);
+            }
+        }
+        self.error = true;
+        None
+    }
+
+    pub fn register_push(&mut self, nreg: u8) -> u8 {
+        self.registers.push(nreg);
+        if self.is_temp(nreg) {
+            self.ntemps += 1;
+        }
+        nreg
+    }
+    pub fn first_temp_available(&self) -> Option<u8> {
+        for i in 0..256 {
+            if !self.state[i] {
+                return Some(i as u8);
+            }
+        }
+        None
+    }
+    pub fn register_push_temp(&mut self) -> Option<u8> {
+        let value = self.register_new()?;
+        self.registers.push(value);
+        if value > self.maxtemp as u8 {
+            self.maxtemp = value as _;
+            self.ntemps += 1;
+        }
+        Some(value)
+    }
+
+    pub fn register_push_temp_protected(&mut self) -> Option<u8> {
+        let val = self.register_push_temp()?;
+        self.register_temp_protect(val);
+        Some(val)
+    }
+
+    pub fn register_clear(&mut self, nreg: u8) {
+        if nreg >= self.nlocals {
+            self.state[nreg as usize] = false;
+        }
+    }
+
+    pub fn register_temps_clear(&mut self) {
+        for i in self.nlocals..=self.maxtemp {
+            if !self.skipclear[i as usize] {
+                self.state[i as usize] = false;
+            }
+        }
+    }
+    pub fn register_temp_protect(&mut self, nreg: u8) {
+        self.skipclear[nreg as usize] = true;
+    }
+    pub fn register_temp_unprotect(&mut self, nreg: u8) {
+        self.skipclear[nreg as usize] = false;
+    }
+    pub fn register_count(&self) -> usize {
+        self.registers.len()
+    }
+
+    pub fn register_last(&self) -> Option<u8> {
+        self.registers.last().copied()
+    }
+
+    pub fn register_set(&mut self, nreg: u8) {
+        if nreg >= self.nlocals {
+            self.state[nreg as usize] = true;
+        }
+    }
+    pub fn register_pop(&mut self) -> Option<u8> {
+        self.register_pop_context_protect(false)
+    }
+    pub fn register_pop_context_protect(&mut self, protect: bool) -> Option<u8> {
+        let value = self.registers.pop()?;
+        if protect {
+            self.state[value as usize] = true;
+        } else if value >= self.nlocals {
+            self.state[value as usize] = false;
+        }
+
+        if protect && value >= self.nlocals {
+            let ctx = self.context.last_mut().unwrap();
+            ctx[value as usize] = true;
+        }
+        Some(value)
+    }
+    pub fn is_temp(&self, nreg: u8) -> bool {
+        nreg >= self.nlocals as u8
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct UpvalLoc {
-    pub local: bool,
-    pub index: u16,
-}
-
-#[allow(dead_code)]
 pub struct Compiler {
-    parent: Option<*mut Compiler>,
-    pub code: Vec<Op>,
+    parent: Option<*mut Self>,
+    pub code: Code,
     free_variables: Vec<FreeVariableInfo>,
     free_upvariables: Vec<FreeVariableInfo>,
     local_free_variable_count: usize,
     upvalue_count: usize,
-    stack_max: usize,
-    stack_size: isize,
-    locals: usize,
-    constants: Vector<Value, Heap>,
 
+    constants: Vector<Value, Heap>,
     closure: bool,
     name: Option<Managed<ScmString>>,
     env: Managed<ScmTable>,
     depth: usize,
-    dump_bytecode: bool,
+    locals: usize,
+    dump: bool,
 }
+
 unsafe impl Trace for Compiler {
     fn trace(&mut self, vis: &mut dyn comet::api::Visitor) {
         match self.parent {
@@ -101,9 +224,7 @@ impl Compiler {
         self.free_upvariables.clear();
         self.local_free_variable_count = 0;
         self.upvalue_count = 0;
-        self.stack_max = 0;
-        self.stack_size = 0;
-        self.locals = 0;
+
         self.closure = false;
         self.name = None;
         self.constants.clear();
@@ -112,19 +233,19 @@ impl Compiler {
         thread: &mut SchemeThread,
         parent: Option<*mut Self>,
         env: Option<Managed<ScmTable>>,
+        nlocals: usize,
+
         depth: usize,
     ) -> Self {
         let constants = Vector::new(&mut thread.mutator);
         Self {
             free_upvariables: vec![],
-            dump_bytecode: thread.runtime.inner().dump_bytecode,
+            dump: thread.runtime.inner().dump_bytecode,
             parent,
-            code: vec![],
+            code: Code::new(nlocals),
             free_variables: vec![],
             local_free_variable_count: 0,
             upvalue_count: 0,
-            stack_max: 0,
-            stack_size: 0,
             locals: 0,
             constants,
             closure: false,
@@ -133,14 +254,12 @@ impl Compiler {
             depth,
         }
     }
-
-    pub fn dump(&self, message: &str) {
-        if self.dump_bytecode {
-            for _ in 0..self.depth {
-                eprint!(" ");
-            }
-            eprintln!("cc: {}", message);
-        }
+    pub fn syntax_error(&mut self, thread: &mut SchemeThread, message: impl AsRef<str>) -> Value {
+        let tag = thread
+            .runtime
+            .global_symbol(crate::runtime::Global::ScmCompile);
+        let msg = make_string(thread, format!("syntax error: {}", message.as_ref()));
+        Value::new(make_exception(thread, tag, msg, Value::new(Null)))
     }
     pub fn module(&mut self, thread: &mut SchemeThread, exp: &lexpr::Value) -> Result<(), Value> {
         let name = exp
@@ -168,7 +287,56 @@ impl Compiler {
         //thread.runtime.inner().unqualified_imports.push(module);
         Ok(())
     }
+    pub fn compile_set(
+        &mut self,
+        thread: &mut SchemeThread,
+        rest: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let rest = rest.as_cons().unwrap();
 
+        let name = make_symbol(thread, rest.car().as_symbol().unwrap());
+        let value = rest.cdr().as_cons().unwrap().car();
+
+        self.compile(thread, value, false)?;
+        let r = self.code.register_pop().unwrap();
+        if let Some(l) = env_lookup(thread, self.env, Value::new(name), false) {
+            self.generate_set(thread, self.env, &l, Value::new(name), r);
+        } else {
+            panic!("undefined variable")
+        }
+
+        Ok(())
+    }
+    pub fn compile_defun(
+        &mut self,
+        thread: &mut SchemeThread,
+        name: Value,
+        lambda: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let value;
+        let l = if env_globalp(thread, self.env) {
+            value = Value::new(name);
+            Lookup::Global {
+                value: Value::new(Undefined),
+                module: Value::new(Undefined),
+            }
+        } else {
+            value = Value::new(self.locals as i32);
+            self.locals += 1;
+            Lookup::Local {
+                index: self.locals - 1,
+                level: 0,
+                up: false,
+                value: Value::new(self.locals as i32 - 1),
+            }
+        };
+        let exporting = self.exporting(thread);
+        env_define(thread, self.env, Value::new(name), value, exporting);
+        self.compile_lambda(thread, lambda, name)?;
+        let r = self.code.register_pop().unwrap();
+        self.generate_set(thread, self.env, &l, Value::new(name), r);
+        Ok(())
+    }
     pub fn compile(
         &mut self,
         thread: &mut SchemeThread,
@@ -178,26 +346,31 @@ impl Compiler {
         match exp {
             lexpr::Value::Char(x) => {
                 let x = *x as i32;
-                self.emit(Op::PushInt(x));
-                self.push(1);
+                let r = self.code.register_push_temp().unwrap();
+                self.code.emit(Opcode::LoadI(r, x));
             }
             lexpr::Value::Bool(x) => {
+                let r = self.code.register_push_temp().unwrap();
                 if !*x {
-                    self.emit(Op::PushFalse);
+                    self.code.emit(Opcode::LoadF(r));
                 } else {
-                    self.emit(Op::PushTrue);
+                    self.code.emit(Opcode::LoadT(r));
                 }
-                //self.dump(&format!("push-{}", x));
-                self.push(1);
             }
             lexpr::Value::Number(x) => {
-                if x.is_i64() && x.as_i64().unwrap() as i32 as i64 == x.as_i64().unwrap() {
-                    self.emit(Op::PushInt(x.as_i64().unwrap() as i32));
-                    self.push(1);
-                    // self.dump(&format!("push-int {}", x.as_i64().unwrap()));
+                let r = self.code.register_push_temp().unwrap();
+                if let Some(x) = x.as_i64() {
+                    if x as i32 as i64 == x {
+                        self.code.emit(Opcode::LoadI(r, x as i32));
+                    } else {
+                        let c = self.new_constant(thread, Value::new(x as f64));
+                        self.code.emit(Opcode::LoadK(r, c));
+                    }
+                } else if let Some(x) = x.as_f64() {
+                    let c = self.new_constant(thread, Value::new(x));
+                    self.code.emit(Opcode::LoadK(r, c));
                 } else {
-                    let x = Value::new(x.as_f64().unwrap());
-                    self.push_constant(thread, x);
+                    todo!()
                 }
             }
             lexpr::Value::Symbol(sym) => {
@@ -221,12 +394,6 @@ impl Compiler {
                             self.compile_lambda(thread, cons.cdr(), Value::encode_null_value())?;
                             return Ok(());
                         }
-                        "while" => {
-                            let pred = cons.cdr().as_cons().unwrap().car();
-                            let body = cons.cdr().as_cons().unwrap().cdr();
-                            self.compile_while(thread, pred, body)?;
-                            return Ok(());
-                        }
                         "defun" => {
                             let name = cons.cdr().as_cons().unwrap().car();
                             let name = if let lexpr::Value::Symbol(x) = name {
@@ -247,7 +414,9 @@ impl Compiler {
                         }
                         "quote" | "'" => {
                             let val = lexpr_to_value(thread, cons.cdr().as_cons().unwrap().car());
-                            self.push_constant(thread, val);
+                            let c = self.new_constant(thread, val);
+                            let r = self.code.register_push_temp().unwrap();
+                            self.code.emit(Opcode::LoadK(r, c));
                             return Ok(());
                         }
                         "`" => {
@@ -307,7 +476,8 @@ impl Compiler {
                             };
                             let body = cons.cdr().as_cons().unwrap().cdr();
                             self.compile_macro(thread, Value::new(name), body)?;
-                            self.push_constant(thread, Value::new(Null));
+                            let r = self.code.register_push_temp().unwrap();
+                            self.code.emit(Opcode::LoadN(r));
                             return Ok(());
                         }
                         x => {
@@ -329,77 +499,18 @@ impl Compiler {
                 self.compile_apply(thread, exp, tail)?;
             }
             lexpr::Value::Null => {
-                self.emit(Op::PushNull);
-                self.push(1);
+                let r = self.code.register_push_temp().unwrap();
+                self.code.emit(Opcode::LoadN(r));
             }
             lexpr::Value::String(x) => {
                 let string = make_string(thread, x);
-                self.push_constant(thread, Value::new(string));
+                let c = self.new_constant(thread, Value::new(string));
+                let r = self.code.register_push_temp().unwrap();
+                self.code.emit(Opcode::LoadK(r, c));
             }
             _ => todo!("{:?}", exp),
         }
         Ok(())
-    }
-
-    pub fn compile_while(
-        &mut self,
-        thread: &mut SchemeThread,
-        pred: &lexpr::Value,
-        body: &lexpr::Value,
-    ) -> Result<(), Value> {
-        self.emit(Op::PushNull);
-        self.push(1);
-        let loop_start = self.code.len();
-
-        self.compile(thread, pred, false)?;
-
-        let patch = self.code.len();
-        //self.dump("jump-if-false");
-        self.emit(Op::JumpIfFalse(0));
-        self.emit(Op::Pop);
-        self.pop(2);
-
-        let prev = self.stack_size;
-        self.compile_begin(thread, body, false)?;
-        if self.stack_size - prev == 0 {
-            self.emit(Op::PushNull);
-        }
-        self.emit(Op::LoopHint);
-        self.emit(Op::Jump(loop_start as _));
-        let to = self.code.len();
-        self.code[patch] = Op::JumpIfFalse(to as _);
-        Ok(())
-    }
-    pub fn compile_begin(
-        &mut self,
-        thread: &mut SchemeThread,
-        exp: &lexpr::Value,
-        tail: bool,
-    ) -> Result<(), Value> {
-        if exp.is_null() {
-            self.push_constant(thread, Value::new(Null));
-            return Ok(());
-        }
-
-        match exp.as_cons() {
-            Some(cons) => {
-                if cons.cdr().is_null() {
-                    self.compile(thread, cons.car(), tail)?;
-                    Ok(())
-                } else {
-                    self.compile(thread, cons.car(), false)?;
-
-                    self.compile_begin(thread, cons.cdr(), tail)
-                }
-            }
-            None => Err(self.syntax_error(
-                thread,
-                &format!(
-                    "Unexpected value passed to begin block instead of a cons: {}",
-                    exp
-                ),
-            )),
-        }
     }
     pub fn macro_expand_1_step(
         &mut self,
@@ -460,7 +571,6 @@ impl Compiler {
         }
         Ok(expanded)
     }
-
     pub fn compile_macro(
         &mut self,
         thread: &mut SchemeThread,
@@ -511,9 +621,60 @@ impl Compiler {
         exp: &lexpr::Value,
         tail: bool,
     ) -> Result<(), Value> {
-        let old_stack_size = self.stack_size;
         let mut args = exp.as_cons().unwrap().cdr();
+        self.code.push_context();
+        self.compile(thread, exp.as_cons().unwrap().car(), false)?;
+
+        let target_register = self.code.register_pop_context_protect(true).unwrap();
+
+        let mut dest_register = target_register;
+
+        if !self.code.is_temp(dest_register) {
+            dest_register = self.code.register_push_temp().unwrap();
+        }
+
+        let temp_target_register = self.code.register_push_temp().unwrap();
+        self.code
+            .emit(Opcode::Move(temp_target_register, target_register));
+        let _treg = self.code.register_pop_context_protect(true).unwrap();
+
+        let mut args_r = vec![];
+        let mut n = 0;
+        let mut j = 0;
         while args.is_cons() {
+            n += 1;
+            let arg = args.as_cons().unwrap().car();
+            self.compile(thread, arg, false)?;
+            let mut nreg = self.code.register_pop_context_protect(true).unwrap();
+            if nreg != temp_target_register + j + 1 {
+                let temp = self.code.register_push_temp().unwrap();
+                self.code.emit(Opcode::Move(temp, nreg));
+                self.code.register_clear(nreg);
+                nreg = self.code.register_pop_context_protect(true).unwrap();
+            }
+            if nreg != temp_target_register + j + 1 {
+                panic!("regalloc for call failed");
+            }
+            args_r.push(nreg);
+            args = args.as_cons().unwrap().cdr();
+            j += 1;
+        }
+
+        if tail {
+            self.code.emit(Opcode::TailApply(temp_target_register, n));
+        } else {
+            self.code
+                .emit(Opcode::Apply(dest_register, temp_target_register, n));
+        }
+
+        self.code.register_clear(temp_target_register);
+        for arg in args_r {
+            self.code.register_clear(arg);
+        }
+        self.code.register_push(dest_register);
+        self.code.register_protect_outside_context(dest_register);
+        self.code.pop_context();
+        /*while args.is_cons() {
             self.compile(thread, args.as_cons().unwrap().car(), false)?;
             args = args.as_cons().unwrap().cdr();
         }
@@ -522,118 +683,15 @@ impl Compiler {
 
         if tail {
             self.emit(Op::TailApply(argc as _));
-            //   self.dump(&format!("tail-apply {}", argc));
+            self.dump(&format!("tail-apply {}", argc));
         } else {
             self.emit(Op::Apply(argc as _));
-            // self.dump(&format!("apply {}", argc));
+            self.dump(&format!("apply {}", argc));
         }
 
         self.pop(self.stack_size as usize - old_stack_size as usize);
         self.push(1);
-
-        Ok(())
-    }
-
-    pub fn compile_set(
-        &mut self,
-        thread: &mut SchemeThread,
-        rest: &lexpr::Value,
-    ) -> Result<(), Value> {
-        let rest = rest.as_cons().unwrap();
-
-        let name = make_symbol(thread, rest.car().as_symbol().unwrap());
-        let value = rest.cdr().as_cons().unwrap().car();
-
-        self.compile(thread, value, false)?;
-        if let Some(l) = env_lookup(thread, self.env, Value::new(name), false) {
-            self.generate_set(thread, self.env, &l, Value::new(name));
-        } else {
-            panic!("undefined variable")
-        }
-
-        Ok(())
-    }
-    pub fn exporting(&self, thread: &mut SchemeThread) -> bool {
-        let exporting = thread
-            .runtime
-            .global_symbol(crate::runtime::Global::Exporting);
-        env_globalp(thread, self.env) && self.env.contains(Value::new(exporting))
-    }
-    pub fn compile_defun(
-        &mut self,
-        thread: &mut SchemeThread,
-        name: Value,
-        lambda: &lexpr::Value,
-    ) -> Result<(), Value> {
-        let value;
-        let l = if env_globalp(thread, self.env) {
-            value = Value::new(name);
-            Lookup::Global {
-                value: Value::new(Undefined),
-                module: Value::new(Undefined),
-            }
-        } else {
-            value = Value::new(self.locals as i32);
-            self.locals += 1;
-            Lookup::Local {
-                index: self.locals - 1,
-                level: 0,
-                up: false,
-                value: Value::new(self.locals as i32 - 1),
-            }
-        };
-        let exporting = self.exporting(thread);
-        env_define(thread, self.env, Value::new(name), value, exporting);
-        self.compile_lambda(thread, lambda, name)?;
-        self.generate_set(thread, self.env, &l, Value::new(name));
-        Ok(())
-    }
-
-    pub fn compile_define(
-        &mut self,
-        thread: &mut SchemeThread,
-        rest: &lexpr::Value,
-        _tail: bool,
-    ) -> Result<(), Value> {
-        let rest = rest.as_cons().unwrap();
-        let name = make_symbol(thread, rest.car().as_symbol().unwrap());
-        let expr = rest.cdr().as_cons().unwrap().car();
-        let value;
-        let l = if env_globalp(thread, self.env) {
-            value = Value::new(name);
-            Lookup::Global {
-                value: Value::new(Undefined),
-                module: Value::new(Undefined),
-            }
-        } else {
-            value = Value::new(self.locals as i32);
-            self.locals += 1;
-            Lookup::Local {
-                index: self.locals - 1,
-                level: 0,
-                up: false,
-                value: Value::new(self.locals as i32 - 1),
-            }
-        };
-        let exporting = self.exporting(thread);
-        env_define(thread, self.env, Value::new(name), value, exporting);
-        self.compile(thread, expr, false)?;
-
-        self.generate_set(thread, self.env, &l, Value::new(name));
-        Ok(())
-    }
-    pub fn compile_lambda(
-        &mut self,
-        thread: &mut SchemeThread,
-        exp: &lexpr::Value,
-        name: Value,
-    ) -> Result<(), Value> {
-        let mut closure = false;
-        let proto = self.generate_lambda(thread, 0, exp, false, name, &mut closure)?;
-        self.push_constant(thread, proto);
-        if closure {
-            self.emit(Op::CloseOver);
-        }
+        */
         Ok(())
     }
     pub fn compile_lambda_no_push(
@@ -647,6 +705,68 @@ impl Compiler {
 
         Ok(proto)
     }
+    pub fn compile_if(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        tail: bool,
+    ) -> Result<(), Value> {
+        let condition = exp.as_cons().unwrap().car();
+
+        let else_expr = exp
+            .as_cons()
+            .unwrap()
+            .cdr()
+            .as_cons()
+            .unwrap()
+            .cdr()
+            .as_cons()
+            .map(|x| x.car());
+
+        self.compile(thread, condition, false)?;
+        let val = self.code.register_pop().unwrap();
+        let merge_register = self.code.register_push_temp().unwrap();
+        let jmp1 = self.code.list.len();
+        self.code.emit(Opcode::JumpIfFalse(val, 0));
+
+        match exp.as_cons().unwrap().cdr().as_cons() {
+            Some(x) => {
+                self.compile(thread, x.car(), tail)?;
+            }
+            None => {
+                self.compile(thread, exp.as_cons().unwrap().cdr(), tail)?;
+            }
+        }
+        let r = self.code.register_pop();
+        self.code.emit(Opcode::Move(merge_register, r.unwrap()));
+        let jmp2 = self.code.list.len();
+        self.code.emit(Opcode::Jump(0));
+        let lbl1 = self.code.list.len();
+        match else_expr {
+            Some(val) => {
+                self.compile(thread, val, tail)?;
+                let r = self.code.register_pop();
+                self.code.emit(Opcode::Move(merge_register, r.unwrap()));
+            }
+            None => {
+                let c = self.new_constant(thread, Value::new(Null));
+
+                self.code.emit(Opcode::LoadK(merge_register, c));
+            }
+        }
+
+        let lbl2 = self.code.list.len();
+
+        self.code.list[jmp1] = Opcode::JumpIfFalse(val, lbl1 as _);
+        self.code.list[jmp2] = Opcode::Jump(lbl2 as _);
+        Ok(())
+    }
+    pub fn exporting(&self, thread: &mut SchemeThread) -> bool {
+        let exporting = thread
+            .runtime
+            .global_symbol(crate::runtime::Global::Exporting);
+        env_globalp(thread, self.env) && self.env.contains(Value::new(exporting))
+    }
     pub fn compile_ref(&mut self, thread: &mut SchemeThread, exp: &Box<str>) -> Result<(), Value> {
         let name = make_symbol(thread, exp);
         let name = Value::new(name);
@@ -658,15 +778,53 @@ impl Compiler {
             return Err(self.syntax_error(thread, format!("undefined variable '{}'", exp)));
         }
     }
+    pub fn compile_define(
+        &mut self,
+        thread: &mut SchemeThread,
+        rest: &lexpr::Value,
+        _tail: bool,
+    ) -> Result<(), Value> {
+        let rest = rest.as_cons().unwrap();
+        let name = make_symbol(thread, rest.car().as_symbol().unwrap());
+        let expr = rest.cdr().as_cons().unwrap().car();
+        let value;
+        let p = thread.runtime.global_symbol(crate::runtime::Global::Parent);
+        let mut global = self.env;
 
-    pub fn syntax_error(&mut self, thread: &mut SchemeThread, message: impl AsRef<str>) -> Value {
-        let tag = thread
-            .runtime
-            .global_symbol(crate::runtime::Global::ScmCompile);
-        let msg = make_string(thread, format!("syntax error: {}", message.as_ref()));
-        Value::new(make_exception(thread, tag, msg, Value::new(Null)))
+        while !env_globalp(thread, global) {
+            global = global.get(Value::new(p)).unwrap().table();
+        }
+        let l = {
+            value = Value::new(name);
+            Lookup::Global {
+                value: Value::new(Undefined),
+                module: Value::new(Undefined),
+            }
+        };
+
+        let exporting = self.exporting(thread);
+        env_define(thread, self.env, Value::new(name), value, exporting);
+        self.compile(thread, expr, false)?;
+        let r = self.code.register_pop().unwrap();
+        self.generate_set(thread, self.env, &l, Value::new(name), r);
+        Ok(())
     }
-
+    pub fn compile_lambda(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        name: Value,
+    ) -> Result<(), Value> {
+        let mut closure = false;
+        let proto = self.generate_lambda(thread, 0, exp, false, name, &mut closure)?;
+        let x = self.new_constant(thread, proto);
+        let r = self.code.register_push_temp().unwrap();
+        self.code.emit(Opcode::LoadK(r, x));
+        if closure {
+            self.code.emit(Opcode::Closure(r, r));
+        }
+        Ok(())
+    }
     pub fn generate_lambda(
         &mut self,
         thread: &mut SchemeThread,
@@ -722,13 +880,19 @@ impl Compiler {
                 format!("lambda expects () or symbol, got '{:?}'", args),
             ));
         }
-        self.dump(&format!("compiling subfunction {}", name));
+
         let stack = thread.mutator.shadow_stack();
+
         letroot!(
             cc = stack,
-            Compiler::new(thread, Some(self), Some(new_env), self.depth + 1)
+            Compiler::new(
+                thread,
+                Some(self),
+                Some(new_env),
+                argc as usize,
+                self.depth + 1,
+            )
         );
-        cc.locals = argc as _;
 
         if !name.is_null() {
             cc.name = Some(name.symbol_name());
@@ -738,72 +902,19 @@ impl Compiler {
 
         let proto = cc.end(thread, argc as _, variable_arity);
         *closure = cc.closure;
-        self.dump(&format!(
-            "subfunction compiled {} (upvalues: {})",
-            Value::new(proto),
-            proto.upvalues.len() / size_of::<UpvalLoc>()
-        ));
+
         Ok(Value::new(proto))
     }
-
-    pub fn compile_if(
-        &mut self,
-        thread: &mut SchemeThread,
-        exp: &lexpr::Value,
-        tail: bool,
-    ) -> Result<(), Value> {
-        let condition = exp.as_cons().unwrap().car();
-
-        let else_expr = exp
-            .as_cons()
-            .unwrap()
-            .cdr()
-            .as_cons()
-            .unwrap()
-            .cdr()
-            .as_cons()
-            .map(|x| x.car());
-
-        self.compile(thread, condition, false)?;
-
-        let jmp1 = self.code.len();
-        self.emit(Op::JumpIfFalse(0));
-
-        self.pop(1);
-        //self.dump("jump-if-false");
-
-        let old_stack = self.stack_size as usize;
-
-        match exp.as_cons().unwrap().cdr().as_cons() {
-            Some(x) => {
-                self.compile(thread, x.car(), tail)?;
-            }
-            None => {
-                self.compile(thread, exp.as_cons().unwrap().cdr(), tail)?;
+    pub fn new_constant(&mut self, thread: &mut SchemeThread, constant: Value) -> u16 {
+        for i in 0..self.constants.len() {
+            if self.constants[i] == constant {
+                return i as u16;
             }
         }
-        self.pop(self.stack_size as usize - old_stack);
-        let jmp2 = self.code.len();
-        self.emit(Op::Jump(0));
-        // self.dump("jump");
-        let lbl1 = self.code.len();
-        match else_expr {
-            Some(val) => {
-                self.compile(thread, val, tail)?;
-            }
-            None => {
-                self.push_constant(thread, Value::new(Null));
-            }
-        }
-        self.pop(self.stack_size as usize - old_stack);
-        let lbl2 = self.code.len();
-        //self.dump(&format!("Patch jump-if-false {}", lbl1));
-        //self.dump(&format!("Patch jump {}", lbl2));
-        self.code[jmp1] = Op::JumpIfFalse(lbl1 as _);
-        self.code[jmp2] = Op::Jump(lbl2 as _);
-        Ok(())
+        let i = self.constants.len();
+        self.constants.push(&mut thread.mutator, constant);
+        i as _
     }
-
     pub fn register_free_variable(&mut self, lookup: &Lookup, name: Value) -> usize {
         let mut l = FreeVariableInfo {
             index: 0,
@@ -858,19 +969,71 @@ impl Compiler {
             unreachable!()
         }
     }
-    pub fn emit(&mut self, op: Op) {
-        self.code.push(op);
+
+    pub fn generate_ref(
+        &mut self,
+        thread: &mut SchemeThread,
+        lookup: &Lookup,
+        _exp: Value,
+        name: Value,
+    ) -> Result<(), Value> {
+        match lookup {
+            Lookup::Global { module, .. } => {
+                let tmp = env_qualify_name(thread, module.table(), name);
+                let c = self.new_constant(thread, Value::new(tmp));
+                let nreg = self.code.register_push_temp().unwrap();
+                self.code.emit(Opcode::LoadG(nreg, c));
+                Ok(())
+            }
+            Lookup::Local { index, up, .. } => {
+                if !*up {
+                    self.code.register_push(*index as _);
+                } else {
+                    let index = self.register_free_variable(lookup, name);
+                    let nreg = self.code.register_push_temp().unwrap();
+                    self.code.emit(Opcode::LoadU(nreg, index as _));
+                }
+                Ok(())
+            }
+        }
     }
-    pub fn emit_pop(&mut self) {
-        self.emit(Op::Pop);
-        self.pop(1);
+    pub fn generate_set(
+        &mut self,
+        thread: &mut SchemeThread,
+        env: Managed<ScmTable>,
+        lookup: &Lookup,
+        name: Value,
+        r: u8,
+    ) {
+        match lookup {
+            Lookup::Global { .. } => {
+                let p = thread.runtime.global_symbol(crate::runtime::Global::Parent);
+                let mut global = env;
+
+                while !env_globalp(thread, global) {
+                    global = global.get(Value::new(p)).unwrap().table();
+                }
+                let qualified_name = env_qualify_name(thread, global, name);
+
+                let c = self.new_constant(thread, Value::new(qualified_name));
+
+                self.code.emit(Opcode::StoreG(c, r));
+            }
+            Lookup::Local { index, up, .. } => {
+                if *up {
+                    let index = self.register_free_variable(lookup, name);
+                    self.code.emit(Opcode::StoreU(index as _, r));
+                } else {
+                    self.code.emit(Opcode::Move(*index as u8, r));
+                }
+            }
+        }
     }
     pub fn enter_module(
         &mut self,
         thread: &mut SchemeThread,
         internal_name: Value,
     ) -> Result<(), Value> {
-        self.dump(&format!("entering module {}", internal_name));
         if module_loaded(thread, internal_name.string()) {
             self.env = thread
                 .runtime
@@ -891,117 +1054,57 @@ impl Compiler {
         self.env = module_env;
         Ok(())
     }
-    pub fn generate_ref(
+    pub fn compile_begin(
         &mut self,
         thread: &mut SchemeThread,
-        lookup: &Lookup,
-        _exp: Value,
-        name: Value,
+        exp: &lexpr::Value,
+        tail: bool,
     ) -> Result<(), Value> {
-        match lookup {
-            Lookup::Global { module, .. } => {
-                let tmp = env_qualify_name(thread, module.table(), name);
-                self.push_constant(thread, Value::new(tmp));
-                self.emit(Op::GlobalGet);
-                //self.dump("global-get");
-                Ok(())
-            }
-            Lookup::Local { index, up, .. } => {
-                if !*up {
-                    self.emit(Op::LocalGet(*index as _));
-                    self.push(1);
-                    // self.dump(&format!("local-get {}", index));
+        if exp.is_null() {
+            let r = self.code.register_push_temp().unwrap();
+            self.code.emit(Opcode::LoadN(r));
+            return Ok(());
+        }
+
+        match exp.as_cons() {
+            Some(cons) => {
+                if cons.cdr().is_null() {
+                    self.compile(thread, cons.car(), tail)?;
+                    Ok(())
                 } else {
-                    let index = self.register_free_variable(lookup, name);
-                    self.emit(Op::UpvalueGet(index as _));
-                    self.push(1);
-                    //  self.dump(&format!("upvalue-get {} : {}", index, name));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub fn generate_set(
-        &mut self,
-        thread: &mut SchemeThread,
-        env: Managed<ScmTable>,
-        lookup: &Lookup,
-        name: Value,
-    ) {
-        match lookup {
-            Lookup::Global { .. } => {
-                let p = thread.runtime.global_symbol(crate::runtime::Global::Parent);
-                let mut global = env;
-
-                while !env_globalp(thread, global) {
-                    global = global.get(Value::new(p)).unwrap().table();
-                }
-                let qualified_name = env_qualify_name(thread, global, name);
-
-                self.push_constant(thread, Value::new(qualified_name));
-                self.emit(Op::GlobalSet);
-                //    self.dump("global-set");
-                self.pop(1);
-            }
-            Lookup::Local { index, up, .. } => {
-                if *up {
-                    let index = self.register_free_variable(lookup, name);
-                    self.emit(Op::UpvalueSet(index as _));
-                    //  self.dump(&format!("upvalue-set {} : {}", index, name));
-                } else {
-                    self.emit(Op::LocalSet(*index as _));
-                    //  self.dump(&format!("local-set {}", index));
+                    self.compile(thread, cons.car(), false)?;
+                    self.code.register_pop().unwrap();
+                    self.compile_begin(thread, cons.cdr(), tail)
                 }
             }
-        }
-        self.pop(1);
-    }
-
-    pub fn push_constant(&mut self, thread: &mut SchemeThread, constant: Value) {
-        self.push(1);
-        for i in 0..self.constants.len() {
-            if self.constants[i] == constant {
-                self.emit(Op::PushConstant(i as _));
-                // self.dump(&format!("push-constant {} : {}", i, constant));
-                return;
-            }
-        }
-        let i = self.constants.len();
-        self.constants.push(&mut thread.mutator, constant);
-        self.emit(Op::PushConstant(i as _));
-
-        //assert!(i < self.constants.len());
-        // self.dump(&format!("push-constant {} : {}", i, constant));
-    }
-
-    pub fn push(&mut self, i: usize) {
-        self.stack_size += i as isize;
-        if self.stack_size as usize > self.stack_max {
-            self.stack_max = self.stack_size as _;
+            None => Err(self.syntax_error(
+                thread,
+                &format!(
+                    "Unexpected value passed to begin block instead of a cons: {}",
+                    exp
+                ),
+            )),
         }
     }
-
-    pub fn pop(&mut self, i: usize) {
-        self.stack_size -= i as isize;
-        if self.stack_size < 0 {
-            assert!(false, "stack underflow");
-        }
-    }
-
     pub fn end(
         &mut self,
         thread: &mut SchemeThread,
         arguments: usize,
         variable_arity: bool,
     ) -> Managed<ScmPrototype> {
-        self.emit(Op::Return);
-        let codeblob = make_blob::<Op>(thread, self.code.len());
+        let r = self.code.register_pop();
+        match r {
+            Some(r) => {
+                self.code.emit(Opcode::Return(r));
+            }
+            None => self.code.emit(Opcode::Return0),
+        }
+        let codeblob = make_blob::<Opcode>(thread, self.code.list.len());
         let b = Value::new(codeblob);
-        for i in 0..self.code.len() {
+        for i in 0..self.code.list.len() {
             unsafe {
                 // write raw opcode bytes
-                b.blob_set(i, self.code[i]);
+                b.blob_set(i, self.code.list[i]);
             }
         }
 
@@ -1035,32 +1138,34 @@ impl Compiler {
         let debuginfo = make_blob::<u8>(thread, 0);
         let constants = std::mem::replace(&mut self.constants, Vector::new(&mut thread.mutator));
         let entry_points = HashMap::new(&mut thread.mutator);
-        let p = thread.mutator.allocate(
+        let proto = thread.mutator.allocate(
             ScmPrototype {
-                constants,
+                constants: constants,
                 local_free_variables: local_free_vars,
                 local_free_variable_count: self.local_free_variable_count as _,
                 upvalues: upvals,
                 arguments: arguments as _,
                 variable_arity,
                 code: codeblob,
-                debuginfo,
                 entry_points,
-                locals: self.locals as _,
+                debuginfo,
+                locals: self.code.nlocals as _,
                 name: self.name,
-                stack_max: self.stack_max as _,
+                stack_max: self.code.ntemps as u16 + self.code.nlocals as u16,
                 n_calls: AtomicUsize::new(0),
                 jit_code: AtomicPtr::new(null_mut()),
             },
             comet::gc_base::AllocationSpace::Old,
         );
-        if self.dump_bytecode {
-            print_bytecode(p);
+
+        if self.dump {
+            let d = BytecodeDisplay { proto };
+            println!("{}", d);
         }
-        p
+
+        proto
     }
 }
-
 pub fn make_env(
     thread: &mut SchemeThread,
     parent: Value,
@@ -1119,19 +1224,6 @@ pub fn make_env(
 pub fn env_contains(env: Managed<ScmTable>, key: Value) -> bool {
     env.contains(key)
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Lookup {
-    Global {
-        value: Value,
-        module: Value,
-    },
-    Local {
-        index: usize,
-        level: usize,
-        value: Value,
-        up: bool,
-    },
-}
 
 pub fn env_lookup(
     thread: &mut SchemeThread,
@@ -1170,28 +1262,7 @@ pub fn env_lookup(
                     up,
                 });
             }
-        } /*else if env_globalp(thread, env) {
-              let rt = thread.runtime;
-              for module in rt.inner().qualified_imports.iter() {
-                  let module = module.table();
-
-                  let exports = thread
-                      .runtime
-                      .global_symbol(crate::runtime::Global::Exports);
-                  if let Some(exports) = module.get(Value::new(exports)) {
-                      if exports.tablep() {
-                          let table = exports.table();
-
-                          if let Some(val) = table.get(Value::new(key)) {
-                              return Some(Lookup::Global {
-                                  value: val,
-                                  module: Value::new(module),
-                              });
-                          }
-                      }
-                  }
-              }
-          }*/
+        }
         level += 1;
 
         let parent = thread.runtime.global_symbol(crate::runtime::Global::Parent);
@@ -1226,4 +1297,67 @@ pub fn env_lookup(
         }
     }
     None
+}
+
+pub struct BytecodeDisplay {
+    proto: Managed<ScmPrototype>,
+}
+impl std::fmt::Display for BytecodeDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "bytecode for function '")?;
+        match self.proto.name {
+            Some(name) => {
+                write!(f, "{}'", name.string)?;
+            }
+            None => {
+                write!(f, "<anonymous>'")?;
+            }
+        }
+        writeln!(f, " at {:p}", self.proto)?;
+        writeln!(f, " constant pool:")?;
+        for (i, constant) in self.proto.constants.iter().enumerate() {
+            writeln!(f, "  {}: {}", i, constant)?;
+        }
+
+        let code = unsafe {
+            std::slice::from_raw_parts::<Opcode>(
+                self.proto.code.as_ptr().cast(),
+                self.proto.code.len() / size_of::<Opcode>(),
+            )
+        };
+        writeln!(f, " code: ")?;
+        for (ip, op) in code.iter().enumerate() {
+            write!(f, "  {:04}: ", ip)?;
+
+            let _ = match op {
+                &Opcode::Apply(dest, callee, nargs) => {
+                    writeln!(f, "apply r{}, r{}, {}", dest, callee, nargs)
+                }
+                &Opcode::Closure(x, y) => {
+                    writeln!(f, "closure r{}, r{}", x, y)
+                }
+                &Opcode::Jump(x) => {
+                    writeln!(f, "jump {}", x)
+                }
+                &Opcode::JumpIfFalse(x, y) => writeln!(f, "jump_if_false r{}, {}", x, y),
+                &Opcode::JumpIfTrue(x, y) => writeln!(f, "jump_if_true r{}, {}", x, y),
+                &Opcode::LoadF(x) => writeln!(f, "load.#f r{}", x),
+                &Opcode::LoadT(x) => writeln!(f, "load.#t r{}", x),
+                &Opcode::LoadN(x) => writeln!(f, "load.null r{}", x),
+                &Opcode::LoadG(x, c) => writeln!(f, "load.global r{}, c{}", x, c),
+                &Opcode::LoadU(x, i) => writeln!(f, "load.upvalue r{},u{}", x, i),
+                Opcode::LoadK(x, c) => writeln!(f, "load.constant r{}, c{}", x, c),
+                Opcode::LoadI(x, c) => writeln!(f, "load.int r{}, {}", x, c),
+                Opcode::StoreG(x, c) => writeln!(f, "store.global c{}, r{}", x, c),
+                Opcode::StoreU(x, i) => writeln!(f, "store.upvalue u{}, r{}", x, i),
+                Opcode::TailApply(callee, nargs) => {
+                    writeln!(f, "tail.apply r{}, {}", callee, nargs)
+                }
+                Opcode::Move(x, y) => writeln!(f, "move r{}, r{}", x, y),
+                Opcode::Return(x) => writeln!(f, "return r{}", x),
+                Opcode::Return0 => writeln!(f, "return undef"),
+            }?;
+        }
+        Ok(())
+    }
 }
