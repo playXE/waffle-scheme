@@ -6,10 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#comet = { git = "https://github.com/starlight-js/comet" }
-#comet-extra = { git = "https://github.com/starlight-js/comet" }
-comet = { path = "comet/crates/comet" }
-comet-extra = { path = "comet/crates/comet-extra" }
+comet = { git = "https://github.com/starlight-js/comet" }
+comet-extra = { git = "https://github.com/starlight-js/comet" }
+
 lexpr = "0.2"
 alloca = "*"
 num = "0.4"
