@@ -1,18 +1,7 @@
 (import core)
 
-(defun nano-to-milli (x) (/ x 1000000))
-(define z 0)
-(define start (time/now))
 
-(defun bar () 
-    (displayln "Hello!")
-    (define x 0)
-    (while (< x 1000000)
-        (set! z x)
-        (set! x (+ x 1))
-    )
-    (display "loop over: ")
-    (displayln z))
-(bar)
-(define end (time/elapsed start))
-(displayln (nano-to-milli end))
+
+
+(displayln (list* 1 2 3 4))
+(list* 4 3 2 1)

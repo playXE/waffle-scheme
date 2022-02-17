@@ -556,7 +556,21 @@ unsafe fn vm_loop(thread: &mut SchemeThread, trampoline: &mut Trampoline) -> Val
                 thread.trampoline_arguments.extend_from_slice(args);
                 assert!(thread.vm_stack.leave_frame());
                 *trampoline = Trampoline::Call;
-                return Value::new(Undefined);
+                return Value::new(Undefined); /*
+                                              let mut arguments = vec![];
+                                              arguments.extend_from_slice(args);
+
+                                              match apply(thread, callee, &arguments) {
+                                                  Ok(val) => {
+                                                      thread.vm_stack.leave_frame();
+                                                      return val;
+                                                  }
+                                                  Err(val) => {
+                                                      thread.vm_stack.leave_frame();
+                                                      *trampoline = Trampoline::Exception;
+                                                      return val;
+                                                  }
+                                              }*/
             }
             Op::Apply(nargs) => {
                 let callee = frame.pop();
@@ -680,6 +694,7 @@ pub(crate) fn pre_call(
 ) -> Result<*mut Value, Value> {
     if !func.applicablep() {
         let tag = thread.runtime.global_symbol(super::Global::ScmEval);
+        println!("backtrace: {:#?}", thread.backtrace());
         let message = make_string(thread, format!("attempt to apply non-function {}", func));
 
         return Err(Value::new(make_exception(

@@ -421,7 +421,7 @@ impl Compiler {
     ) -> Result<lexpr::Value, Value> {
         let expanded = self.macro_expand_1_step(thread, p, exp)?;
         let mut expanded = crate::runtime::value_to_lexpr(thread, expanded);
-
+        println!("{}", expanded);
         if let Some(cons) = expanded.as_cons_mut() {
             if !cons.car().is_symbol() {
                 return Ok(expanded);
@@ -995,6 +995,10 @@ impl Compiler {
         arguments: usize,
         variable_arity: bool,
     ) -> Managed<ScmPrototype> {
+        while self.stack_size > 1 {
+            self.pop(1);
+            self.emit(Op::Pop);
+        }
         self.emit(Op::Return);
         let codeblob = make_blob::<Op>(thread, self.code.len());
         let b = Value::new(codeblob);

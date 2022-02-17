@@ -42,6 +42,37 @@ pub struct SchemeThread {
 
     pub(crate) rc: u32,
 }
+impl SchemeThread {
+    pub fn backtrace(&self) -> Vec<std::string::String> {
+        let mut stack = vec![];
+        unsafe {
+            let mut frame = self.vm_stack.current_frame;
+            while !frame.is_null() {
+                let next = (*frame).prev;
+                if (*frame).callee.native_functionp() {
+                    stack.push(
+                        (*frame)
+                            .callee
+                            .downcast::<NativeFunction>()
+                            .name
+                            .to_string(),
+                    );
+                } else {
+                    stack.push(
+                        (*frame)
+                            .callee
+                            .prototype()
+                            .name
+                            .map(|x| x.string.to_string())
+                            .unwrap_or_else(|| "anonymous".to_string()),
+                    )
+                }
+                frame = next;
+            }
+        }
+        stack
+    }
+}
 
 pub struct SchemeThreadRef {
     pub(crate) ptr: NonNull<SchemeThread>,

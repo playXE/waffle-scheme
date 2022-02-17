@@ -121,4 +121,14 @@
                 thunks)
             (vector-map thread/join handles))))
 
-(export append cadr cdar caar cddr caddr transfer map vector-empty? parallel)
+(defun list* args 
+	(letrec ((chase 
+		(lambda (args)
+			(cond 
+				((null? args) '())
+				((null? (cdr args)) (car args))
+				(cons (car args) (chase (cdr args)))))))
+	
+		(chase args)))
+
+(export append cadr cdar caar cddr caddr transfer map vector-empty? parallel list*)
