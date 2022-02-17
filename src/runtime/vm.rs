@@ -694,7 +694,7 @@ pub(crate) fn pre_call(
 ) -> Result<*mut Value, Value> {
     if !func.applicablep() {
         let tag = thread.runtime.global_symbol(super::Global::ScmEval);
-        println!("backtrace: {:#?}", thread.backtrace());
+
         let message = make_string(thread, format!("attempt to apply non-function {}", func));
 
         return Err(Value::new(make_exception(
