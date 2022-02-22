@@ -1,28 +1,62 @@
-use std::{mem::size_of, sync::atomic::AtomicU64};
+use std::sync::atomic::AtomicU64;
 
-use crate::{
-    compiler::UpvalLoc,
-    method_jit::lir::calling_convention,
-    runtime::{
-        value::{Closure, ScmPrototype, Value},
-        vm::{apply, CallFrame},
-        SchemeThread,
-    },
-    Managed,
-};
+use capstone::arch::BuildsCapstone;
+use codegen::settings::{self, Configurable};
+use cranelift::codegen::{self, ir, ir::types};
+use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift::prelude::isa::TargetIsa;
+use cranelift::prelude::{AbiParam, Signature};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::FuncId;
+use cranelift_module::{Linkage, Module};
+use target_lexicon::Triple;
 
-pub mod lir;
-pub mod lower;
+use crate::compiler::{Op, UpvalLoc};
+use crate::method_jit::Trampoline;
+use crate::runtime::value::*;
+use crate::runtime::vm::*;
+use crate::runtime::*;
+use crate::Managed;
+use comet_extra::alloc::vector::Vector;
+use std::mem::size_of;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[repr(C)]
-pub enum Trampoline {
-    Return = 0,
-    Call = 1,
-    Exception = 2,
-    Jit,
+pub mod translate;
+
+pub unsafe extern "C" fn close_over(
+    thread: &mut SchemeThread,
+    frame: &mut CallFrame,
+    proto: Value,
+) -> Value {
+    let p = proto.downcast::<ScmPrototype>();
+    let locations = Value::new(p.upvalues);
+    let upvalues = Vector::with_capacity(
+        &mut thread.mutator,
+        locations.blob_length() / size_of::<UpvalLoc>(),
+    );
+
+    let mut c = thread.mutator.allocate(
+        Closure {
+            prototype: p,
+            upvalues,
+        },
+        comet::gc_base::AllocationSpace::New,
+    );
+    let n = locations.blob_length() / size_of::<UpvalLoc>();
+    for i in 0..n {
+        let l = locations.blob_ref::<UpvalLoc>(i);
+        if l.local {
+            assert!(frame.upvalues > frame.bp.add(frame.si));
+            c.upvalues
+                .push(&mut thread.mutator, frame.upvalues.add(l.index as _).read());
+        } else {
+            c.upvalues.push(
+                &mut thread.mutator,
+                frame.closure.unwrap_unchecked().upvalues[l.index as usize],
+            )
+        }
+    }
+    Value::new(c)
 }
-
 pub type JITSig =
     extern "C" fn(&mut SchemeThread, trampoline: &mut Trampoline, entry_ip: usize) -> Value;
 
@@ -66,27 +100,6 @@ pub extern "C" fn jit_apply(
     }
     val
 }
-use capstone::arch::BuildsCapstone;
-use comet_extra::alloc::vector::Vector;
-use cranelift::{
-    codegen::ir,
-    frontend::Variable,
-    prelude::{
-        codegen::settings::{self, Configurable},
-        types, AbiParam,
-    },
-};
-use cranelift::{
-    codegen::{self},
-    frontend::FunctionBuilderContext,
-};
-use cranelift::{
-    frontend::FunctionBuilder,
-    prelude::{codegen::isa::*, Signature},
-};
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
-use target_lexicon::Triple;
 fn get_isa() -> Box<dyn TargetIsa + 'static> {
     let mut flags_builder = codegen::settings::builder();
     flags_builder.set("opt_level", "speed").unwrap();
@@ -112,6 +125,7 @@ fn disasm() -> capstone::Capstone {
     #[cfg(target_arch = "x86_64")]
     {
         use capstone::arch::BuildsCapstoneSyntax;
+
         cs.x86()
             .mode(capstone::prelude::arch::x86::ArchMode::Mode64)
             .syntax(capstone::prelude::arch::x86::ArchSyntax::Att)
@@ -121,69 +135,28 @@ fn disasm() -> capstone::Capstone {
     }
 }
 
-pub unsafe extern "C" fn close_over(
-    thread: &mut SchemeThread,
-    frame: &mut CallFrame,
-    proto: Value,
-) -> Value {
-    let p = proto.downcast::<ScmPrototype>();
-    let locations = Value::new(p.upvalues);
-    let upvalues = Vector::with_capacity(
-        &mut thread.mutator,
-        locations.blob_length() / size_of::<UpvalLoc>(),
-    );
+const TRIPLE: Triple = Triple::host();
+use codegen::isa;
 
-    let mut c = thread.mutator.allocate(
-        Closure {
-            prototype: p,
-            upvalues,
-        },
-        comet::gc_base::AllocationSpace::New,
-    );
-    let n = locations.blob_length() / size_of::<UpvalLoc>();
-    for i in 0..n {
-        let l = locations.blob_ref::<UpvalLoc>(i);
-        if l.local {
-            assert!(frame.upvalues > frame.bp.add(frame.si));
-            c.upvalues
-                .push(&mut thread.mutator, frame.upvalues.add(l.index as _).read());
-        } else {
-            c.upvalues.push(
-                &mut thread.mutator,
-                frame.closure.unwrap_unchecked().upvalues[l.index as usize],
-            )
-        }
-    }
-    Value::new(c)
+use self::translate::C1Translator;
+
+use super::bc2lbc::BC2LBC;
+
+pub fn calling_convention() -> isa::CallConv {
+    isa::CallConv::triple_default(&TRIPLE)
 }
 
-pub struct MethodJIT {
+pub struct C1JIT {
     builder: FunctionBuilderContext,
     ctx: codegen::Context,
     module: JITModule,
+    isa: Box<dyn TargetIsa>,
     trampoline: FuncId,
     apply: FuncId,
     close_over: FuncId,
 }
-static ID: AtomicU64 = AtomicU64::new(0);
 
-fn get_jit_name(f: Managed<ScmPrototype>) -> String {
-    match f.name {
-        Some(name) => format!(
-            "{}(jit-{})",
-            name.string,
-            ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ),
-        None => {
-            format!(
-                "jit-{}",
-                ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            )
-        }
-    }
-}
-
-impl MethodJIT {
+impl C1JIT {
     pub fn new() -> Self {
         let mut builder =
             JITBuilder::with_isa(get_isa(), cranelift_module::default_libcall_names());
@@ -233,20 +206,18 @@ impl MethodJIT {
             ctx: module.make_context(),
             module,
             builder: FunctionBuilderContext::new(),
+            isa: get_isa(),
         }
     }
 
-    pub fn compile(
-        &mut self,
-        thread: &mut SchemeThread,
-        proto: Managed<ScmPrototype>,
-        dump: bool,
-    ) -> *const u8 {
-        let lir = lower::lower(thread, proto);
+    pub fn compile(&mut self, thread: &mut SchemeThread, proto: Managed<ScmPrototype>, dump: bool) {
+        let code = proto.code.as_ptr();
+        let len = proto.code.len() / size_of::<Op>();
+        let code = unsafe { std::slice::from_raw_parts::<Op>(code.cast::<Op>(), len) };
 
+        let lbc = BC2LBC::new(proto, code).generate();
+        println!("{}", lbc.display());
         {
-            self.module.clear_context(&mut self.ctx);
-
             for _ in 0..3 {
                 self.ctx
                     .func
@@ -278,72 +249,57 @@ impl MethodJIT {
             let thread = params[0];
             let trampoline = params[1];
             let entry = params[2];
+            let return_block = builder.create_block();
+            builder.append_block_param(return_block, types::I64);
 
-            let mut compiler = lir::LIRCompiler {
-                module: &mut self.module,
+            let mut compiler = C1Translator {
+                module: &self.module,
                 builder,
+                func: &lbc,
+                proto,
                 jit_apply: apply,
                 jit_trampoline: trampolinef,
                 close_over,
-                sp: Variable::with_u32(0),
-                stack: vec![],
-                bp: ir::Value::from_u32(1),
-                frame: ir::Value::from_u32(1),
-                blocks: Default::default(),
+                bp: ir::Value::from_u32(0),
+                frame: ir::Value::from_u32(0),
+                trampoline,
+                thread,
+                fallthrough: false,
+                end_of_block: false,
+                operand_stack: vec![],
                 env: ir::Value::from_u32(0),
-                gen: &lir,
+                closure: ir::Value::from_u32(0),
+                return_block,
+                current: ir::Block::from_u32(0),
+                blocks: Default::default(),
+                ungenerated: Default::default(),
             };
-            compiler.builder.declare_var(compiler.sp, types::I64);
-            //compiler.blocks.insert(0, entry_block);
-            compiler.translate(proto, thread, trampoline, entry);
-            compiler.builder.seal_all_blocks();
-            let name = get_jit_name(proto);
 
+            compiler.generate(entry);
+
+            compiler.builder.seal_all_blocks();
+            println!("{}", compiler.builder.func.display());
             compiler.builder.finalize();
 
             cranelift_preopt::optimize(&mut self.ctx, &*get_isa()).unwrap();
-            if dump {
-                println!(
-                    "JIT: Cranelift IR for function {}: \n{}",
-                    name,
-                    self.ctx.func.display()
-                );
-            }
-            let id = self
-                .module
-                .declare_function(
-                    &name,
-                    cranelift_module::Linkage::Export,
-                    &self.ctx.func.signature,
-                )
-                .unwrap();
-            self.module.define_function(id, &mut self.ctx).unwrap();
+        }
+    }
+}
 
-            let info = self.ctx.compile(&*get_isa()).unwrap();
-            let mut code_ = vec![0; info.total_size as usize];
-            unsafe {
-                self.ctx.emit_to_memory(&mut code_[0]);
-            }
-            if true {
-                // let lock = std::io::stdin();
-                // let lock = lock.lock();
+static ID: AtomicU64 = AtomicU64::new(0);
 
-                //drop(lock);
-            }
-            self.module.clear_context(&mut self.ctx);
-            self.module.finalize_definitions();
-            let code = self.module.get_finalized_function(id);
-            if dump {
-                println!("JIT: Disassembly for function {}: ", name);
-
-                let cs = disasm();
-
-                let insns = cs.disasm_all(&code_, code as _);
-                for ins in insns.unwrap().iter() {
-                    println!("{}", ins);
-                }
-            }
-            code
+fn get_jit_name(f: Managed<ScmPrototype>) -> String {
+    match f.name {
+        Some(name) => format!(
+            "{}(jit-{})",
+            name.string,
+            ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        None => {
+            format!(
+                "jit-{}",
+                ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
         }
     }
 }

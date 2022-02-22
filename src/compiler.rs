@@ -4,15 +4,21 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use comet::{api::Trace, letroot};
+use comet::{
+    api::{Collectable, Finalize, Trace, Visitor},
+    letroot,
+};
 use comet_extra::alloc::{hash::HashMap, vector::Vector};
 
 use crate::{
     runtime::{
-        convert_module_name, env_define, env_globalp, env_qualify_name, lexpr_to_value,
+        cons, convert_module_name, env_define, env_globalp, env_qualify_name, lexpr_to_value,
         load_module, make_blob, make_exception, make_string, make_symbol, make_table, make_vector,
         module_loaded, register_module_,
-        value::{print_bytecode, Macro, Null, ScmPrototype, ScmString, ScmTable, Undefined, Value},
+        value::{
+            print_bytecode, Macro, Null, ScmPrototype, ScmString, ScmSymbol, ScmTable, Undefined,
+            Value,
+        },
         SchemeThread,
     },
     Heap, Managed,
@@ -94,6 +100,20 @@ unsafe impl Trace for Compiler {
     }
 }
 
+pub struct MacroInfo {
+    name: Value,
+    args: Value,
+    body: Value,
+}
+
+unsafe impl Trace for MacroInfo {
+    fn trace(&mut self, vis: &mut dyn Visitor) {
+        self.name.trace(vis);
+        self.args.trace(vis);
+        self.body.trace(vis);
+    }
+}
+
 impl Compiler {
     pub fn clear(&mut self) {
         self.code.clear();
@@ -167,6 +187,349 @@ impl Compiler {
         env.vector_push(thread, module);
         //thread.runtime.inner().unqualified_imports.push(module);
         Ok(())
+    }
+
+    pub fn parse_symbol(
+        &mut self,
+        thread: &mut SchemeThread,
+        val: &lexpr::Value,
+    ) -> Result<Managed<ScmSymbol>, Value> {
+        match val {
+            lexpr::Value::Symbol(x) => Ok(make_symbol(thread, x)),
+            e => return Err(self.syntax_error(thread, format!("symbol expected but found {}", e))),
+        }
+    }
+
+    pub fn parse_args(
+        &mut self,
+        thread: &mut SchemeThread,
+        list: &lexpr::Value,
+    ) -> Result<Value, Value> {
+        if list.is_null() {
+            return Ok(Value::new(Null));
+        }
+
+        match list {
+            lexpr::Value::Cons(pair) => {
+                if let Some(sym) = pair.car().as_symbol() {
+                    let sym = Value::new(make_symbol(thread, sym));
+                    let rest = self.parse_args(thread, pair.cdr())?;
+                    Ok(Value::new(cons(thread, sym, rest)))
+                } else {
+                    Err(self
+                        .syntax_error(thread, format!("expected argument name but found {}", list)))
+                }
+            }
+            lexpr::Value::Symbol(sym) => Ok(Value::new(make_symbol(thread, sym))),
+            _ => Err(self.syntax_error(
+                thread,
+                format!("expected list of arguments but found {}", list),
+            )),
+        }
+    }
+    pub fn parse_begin(
+        &mut self,
+        thread: &mut SchemeThread,
+        body: &lexpr::Value,
+        macros: &mut Vector<MacroInfo, Heap>,
+    ) -> Result<Value, Value> {
+        if body.is_null() {
+            return Ok(Value::new(Null));
+        }
+
+        match body.as_cons() {
+            Some(cons) => {
+                if cons.cdr().is_null() {
+                    let val = self.parse(thread, cons.car(), macros)?;
+
+                    return Ok(Value::new(crate::runtime::cons(
+                        thread,
+                        val,
+                        Value::new(Null),
+                    )));
+                } else {
+                    let first = self.parse(thread, cons.car(), macros)?;
+                    let second = self.parse_begin(thread, cons.cdr(), macros)?;
+                    //let ls = crate::runtime::cons(thread, second, Value::new(Null));
+                    return Ok(Value::new(crate::runtime::cons(
+                        thread,
+                        Value::new(first),
+                        Value::new(second),
+                    )));
+                }
+            }
+            None => Err(self.syntax_error(thread, "malformed begin block")),
+        }
+    }
+    pub fn parse_lambda(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        macros: &mut Vector<MacroInfo, Heap>,
+    ) -> Result<Value, Value> {
+        if let Some(list) = exp.as_cons() {
+            let args = self.parse_args(thread, list.car())?;
+
+            let body = if list.cdr().is_cons() {
+                self.parse_begin(thread, list.cdr(), macros)?
+            } else {
+                let x = self.parse(thread, list.cdr(), macros)?;
+                Value::new(cons(thread, x, Value::new(Null)))
+            };
+            Ok(Value::new(cons(thread, args, body)))
+        } else {
+            Err(self.syntax_error(thread, format!("malformed lambda: {}", exp)))
+        }
+    }
+
+    pub fn expect_cons<'a>(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &'a lexpr::Value,
+        message: impl AsRef<str>,
+    ) -> Result<&'a lexpr::Cons, Value> {
+        match exp {
+            lexpr::Value::Cons(lst) => Ok(lst),
+            exp => {
+                return Err(self.syntax_error(
+                    thread,
+                    format!("expected cons but found {}: {}", exp, message.as_ref()),
+                ))
+            }
+        }
+    }
+    pub fn parse_list(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        macros: &mut Vector<MacroInfo, Heap>,
+    ) -> Result<Value, Value> {
+        if exp.is_null() {
+            return Ok(Value::new(Null));
+        }
+        match exp.as_cons() {
+            Some(lst) => {
+                let car = self.parse(thread, lst.car(), macros)?;
+                let cdr = self.parse_list(thread, lst.cdr(), macros)?;
+                Ok(Value::new(cons(thread, car, cdr)))
+            }
+            None => Err(self.syntax_error(thread, "list of expressions expected")),
+        }
+    }
+    pub fn parse(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        macros: &mut Vector<MacroInfo, Heap>,
+    ) -> Result<Value, Value> {
+        match exp {
+            lexpr::Value::Char(x) => Ok(Value::new(*x as i32)),
+            lexpr::Value::Bool(x) => Ok(Value::new(*x)),
+            lexpr::Value::Number(num) => {
+                if let Some(i) = num.as_i64() {
+                    if i as i32 as i64 == i {
+                        return Ok(Value::new(i as i32));
+                    } else {
+                        return Ok(Value::new(i as f64));
+                    }
+                } else if let Some(f) = num.as_f64() {
+                    return Ok(Value::new(f));
+                } else {
+                    todo!("bigint")
+                }
+            }
+            lexpr::Value::Symbol(sym) => Ok(Value::new(make_symbol(thread, sym))),
+            lexpr::Value::Vector(values) => {
+                let mut vec = make_vector(thread, values.len());
+                for val in values.iter() {
+                    let parsed = self.parse(thread, val, macros)?;
+                    vec.vec.push(&mut thread.mutator, parsed);
+                }
+                Ok(Value::new(vec))
+            }
+            lexpr::Value::Null | lexpr::Value::Nil => Ok(Value::new(Null)),
+            lexpr::Value::String(string) => Ok(Value::new(make_string(thread, string))),
+            lexpr::Value::Cons(pair) => {
+                let first = pair.car();
+                let rest = pair.cdr();
+                match first {
+                    lexpr::Value::Symbol(sym_name) => match &**sym_name {
+                        "module" => {
+                            let _ = self.parse_args(thread, rest)?;
+                            let name = convert_module_name(thread, &rest)?;
+                            self.enter_module(thread, name)?;
+                            return Ok(Value::new(Undefined));
+                        }
+                        // TODO: (import (a) (b))
+                        "import" => {
+                            self.import(thread, rest)?;
+                            return Ok(Value::new(Undefined));
+                        }
+                        // TODO: (rename x y)
+                        "export" => {
+                            self.compile_export(thread, rest)?;
+                            return Ok(Value::new(Undefined));
+                        }
+                        "define" => {
+                            let s_define = make_symbol(thread, "define");
+                            if let Some(lst) = rest.as_cons() {
+                                if let lexpr::Value::Symbol(name) = lst.car() {
+                                    let value = self.parse(thread, lst.cdr(), macros)?;
+                                    let name = make_symbol(thread, name);
+                                    let define_body = cons(thread, Value::new(name), value);
+                                    let define =
+                                        cons(thread, Value::new(s_define), Value::new(define_body));
+                                    return Ok(Value::new(define));
+                                } else if let lexpr::Value::Cons(name_and_args) = lst.car() {
+                                    let s_lambda = Value::new(make_symbol(thread, "lambda"));
+                                    let name = self.parse_symbol(thread, name_and_args.car())?;
+
+                                    let body = if lst.cdr().is_cons() {
+                                        self.parse_begin(thread, lst.cdr(), macros)?
+                                    } else {
+                                        self.parse(thread, lst.cdr(), macros)?
+                                    };
+                                    let args = self.parse_args(thread, name_and_args.cdr())?;
+                                    let body = body;
+                                    let lambda_args_and_body =
+                                        Value::new(cons(thread, args, Value::new(body)));
+                                    let lambda =
+                                        Value::new(cons(thread, s_lambda, lambda_args_and_body));
+                                    let define_body = cons(thread, lambda, Value::new(Null));
+                                    let define_body =
+                                        cons(thread, Value::new(name), Value::new(define_body));
+                                    let define = Value::new(cons(
+                                        thread,
+                                        Value::new(s_define),
+                                        Value::new(define_body),
+                                    ));
+                                    return Ok(define);
+                                }
+                            }
+
+                            return Err(self.syntax_error(thread, "malformed definition"));
+                        }
+                        "defmacro" => {
+                            // (defmacro (name args) body)
+
+                            if let Some(lst) = rest.as_cons() {
+                                if let Some(name_and_args) = lst.car().as_cons() {
+                                    let name = self.parse_symbol(thread, name_and_args.car())?;
+                                    let args = self.parse_args(thread, name_and_args.cdr())?;
+                                    let body = self.parse_begin(thread, lst.cdr(), macros)?;
+                                    let s_defmacro = make_symbol(thread, "defmacro");
+                                    let body = Value::new(cons(thread, body, Value::new(Null)));
+                                    // let args = cons(thread, args, Value::new(Null));
+                                    let name_and_args =
+                                        cons(thread, Value::new(name), Value::new(args));
+                                    let nargs_and_body =
+                                        cons(thread, Value::new(name_and_args), body);
+                                    return Ok(Value::new(cons(
+                                        thread,
+                                        Value::new(s_defmacro),
+                                        Value::new(nargs_and_body),
+                                    )));
+                                }
+                            }
+
+                            return Err(self.syntax_error(thread, "malformed macro definition"));
+                        }
+                        "lambda" => {
+                            let lambda = self.parse_lambda(thread, rest, macros)?;
+
+                            let s_lambda = make_symbol(thread, "lambda");
+                            return Ok(Value::new(cons(
+                                thread,
+                                Value::new(s_lambda),
+                                Value::new(lambda),
+                            )));
+                        }
+                        "if" => {
+                            let lst = self.expect_cons(thread, rest, "malformed if")?;
+                            let condition = self.parse(thread, lst.car(), macros)?;
+                            let then_and_else =
+                                self.expect_cons(thread, lst.cdr(), "<then> and <else> expected")?;
+                            let then = self.parse(thread, then_and_else.car(), macros)?;
+                            let else_ =
+                                self.expect_cons(thread, then_and_else.cdr(), "<else> expected")?;
+                            let else_ = self.parse(thread, else_.car(), macros)?;
+
+                            let else_val = cons(thread, else_, Value::new(Null));
+                            let then_and_else = cons(thread, then, Value::new(else_val));
+                            let s_if = make_symbol(thread, "if");
+                            let cond_and_then = cons(thread, condition, Value::new(then_and_else));
+                            let if_ = cons(thread, Value::new(s_if), Value::new(cond_and_then));
+
+                            return Ok(Value::new(if_));
+                        }
+                        "if*" => {
+                            let list = self.parse_list(thread, rest, macros)?;
+
+                            let s_ifstar = make_symbol(thread, "if*");
+                            return Ok(Value::new(cons(thread, Value::new(s_ifstar), list)));
+                        }
+                        "set!" => {
+                            let list = self.expect_cons(thread, rest, "(set! <name> <value>)")?;
+                            let name = self.parse_symbol(thread, list.car())?;
+                            let rest =
+                                self.expect_cons(thread, list.cdr(), "(set! <name> <value>")?;
+                            let value = self.parse(thread, rest.car(), macros)?;
+                            let value = cons(thread, value, Value::new(Null));
+                            let s_set = make_symbol(thread, "set!");
+                            let list = cons(thread, Value::new(name), Value::new(value));
+                            return Ok(Value::new(cons(
+                                thread,
+                                Value::new(s_set),
+                                Value::new(list),
+                            )));
+                        }
+                        "`" => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol("quasiquote".to_string().into_boxed_str()),
+                                rest.clone(),
+                            ));
+
+                            return self.parse(thread, &value, macros);
+                        }
+                        ",@" => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol(
+                                    "unquote-splicing".to_string().into_boxed_str(),
+                                ),
+                                rest.clone(),
+                            ));
+
+                            return self.parse(thread, &value, macros);
+                        }
+                        "," => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol("unquote".to_string().into_boxed_str()),
+                                rest.clone(),
+                            ));
+
+                            return self.parse(thread, &value, macros);
+                        }
+                        "'" => {
+                            let value = lexpr::Value::Cons(lexpr::Cons::new(
+                                lexpr::Value::Symbol("quote".to_string().into_boxed_str()),
+                                rest.clone(),
+                            ));
+
+                            return self.parse(thread, &value, macros);
+                        }
+                        _ => (),
+                    },
+
+                    _ => {}
+                }
+
+                let exp = self.parse(thread, first, macros)?;
+                let list = self.parse_list(thread, rest, macros)?;
+
+                Ok(Value::new(cons(thread, exp, list)))
+            }
+            _ => todo!("{:?}", exp),
+        }
     }
 
     pub fn compile(
@@ -1038,7 +1401,7 @@ impl Compiler {
         }
         let debuginfo = make_blob::<u8>(thread, 0);
         let constants = std::mem::replace(&mut self.constants, Vector::new(&mut thread.mutator));
-        let entry_points = HashMap::new(&mut thread.mutator);
+
         let p = thread.mutator.allocate(
             ScmPrototype {
                 constants,
@@ -1049,7 +1412,7 @@ impl Compiler {
                 variable_arity,
                 code: codeblob,
                 debuginfo,
-                entry_points,
+                entry_points: Default::default(),
                 locals: self.locals as _,
                 name: self.name,
                 stack_max: self.stack_max as _,

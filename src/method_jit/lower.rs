@@ -51,11 +51,11 @@ impl<'a> FunctionLowerer<'a> {
             .or_insert_with(|| self.gen.new_block())
     }
 
-    pub fn lower(&mut self, thread: &mut SchemeThread, mut proto: Managed<ScmPrototype>) {
+    pub fn lower(&mut self, _thread: &mut SchemeThread, mut proto: Managed<ScmPrototype>) {
         let mut i = 0;
         let entry = self.gen.new_block();
         self.gen.blocks[entry as usize].entrypoint = Some(0);
-        proto.entry_points.insert(&mut thread.mutator, 0, 0);
+        proto.entry_points.insert(0, 0);
         self.gen.switch_to_block(entry);
         while i < self.code.len() {
             if let Some(_cond) = self.targets.get(&(i as u32)).copied() {
@@ -72,9 +72,7 @@ impl<'a> FunctionLowerer<'a> {
                     let entry_point = self.gen.new_block();
                     self.gen.emit(Lir::Jump(entry_point));
 
-                    proto
-                        .entry_points
-                        .insert(&mut thread.mutator, i as u32, entry_point);
+                    proto.entry_points.insert(i as u32, entry_point);
                     self.gen.blocks[entry_point as usize].entrypoint = Some(i as u32);
                     self.gen.switch_to_block(entry_point);
 

@@ -589,7 +589,7 @@ pub type ScmBlob = Managed<Array<u8>>;
 #[allow(dead_code)]
 pub struct ScmPrototype {
     pub(crate) constants: Vector<Value, Heap>,
-    pub(crate) code: ScmBlob,
+    pub code: ScmBlob,
     pub(crate) debuginfo: ScmBlob,
     pub(crate) local_free_variables: ScmBlob,
     pub(crate) upvalues: ScmBlob,
@@ -601,7 +601,7 @@ pub struct ScmPrototype {
     pub(crate) variable_arity: bool,
     pub(crate) jit_code: AtomicPtr<u8>,
     pub(crate) n_calls: AtomicUsize,
-    pub(crate) entry_points: HashMap<u32, u32, Heap>,
+    pub(crate) entry_points: std::collections::HashMap<u32, u32>,
 }
 
 /// A closure, aka a function which references free variables

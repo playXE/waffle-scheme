@@ -2,13 +2,16 @@ use comet::{
     immix::{instantiate_immix, ImmixOptions},
     letroot,
 };
+use comet_extra::alloc::vector::Vector;
 use rustyline::{config::Configurer, Editor};
-use std::path::PathBuf;
+use std::{mem::size_of, path::PathBuf};
 use structopt::StructOpt;
 use waffle::{
-    compiler::Compiler,
+    bytecompiler::ByteCompiler,
+    compiler::{Compiler, Op},
+    jit::{bc2lbc::BC2LBC, c1::C1JIT},
     runtime::{
-        add_module_search_path, load_file,
+        add_module_search_path, load_file, make_symbol,
         value::{Null, Value},
         NanBoxedDecoder, Runtime, SchemeThread,
     },
@@ -67,6 +70,71 @@ fn main() {
         add_module_search_path(&mut thread, path);
     }
 
+    let mut cc = ByteCompiler::new(&mut *thread, None, None, 0);
+
+    let l = cc.new_local();
+
+    cc.while_loop::<(), _, _>(
+        &mut *thread,
+        |_thread, cc| {
+            cc.get_local(l);
+            Ok(())
+        },
+        |thread, cc| {
+            cc.int32(42);
+            let name = make_symbol(thread, "displayln");
+            assert!(cc.variabe_ref(thread, name));
+            cc.apply(1);
+            //cc.pop_();
+            Ok(())
+        },
+    )
+    .unwrap();
+    let proto = cc.end(&mut *thread, 1, false);
+
+    let mut jit = C1JIT::new();
+
+    jit.compile(&mut *thread, proto, true);
+
+    /* let mut cc = Compiler::new(&mut thread, None, None, 0);
+    let reader = std::fs::File::open(opts.filename.unwrap()).unwrap();
+    let mut reader = lexpr::Parser::from_reader(reader);
+    let mut exprs = Vector::new(&mut thread.mutator);
+    let mut macros = Vector::new(&mut thread.mutator);
+    for expr in reader.datum_iter() {
+        match expr {
+            Ok(datum) => {
+                let val = datum.value();
+
+                match cc.parse(&mut thread, val, &mut macros) {
+                    Ok(val) => {
+                        if !val.is_undefined() {
+                            exprs.push(&mut thread.mutator, val);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "failed to parse at {}:{}: {}",
+                            datum.span().start().line(),
+                            datum.span().start().column(),
+                            e
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                return;
+            }
+        }
+    }
+
+    for expr in exprs.iter() {
+        println!("parsed: {}", expr);
+    }
+
+    /*
     /*let mut cc = Compiler::new(&mut thread, None, None, 0);
     let sexp = lexpr::from_str("1").unwrap();
     let _ = cc.compile(&mut thread, &sexp, false);
@@ -87,7 +155,7 @@ fn main() {
         Runtime::terminate(rt, &thread.mutator);
     } else {
         repl(&mut thread);
-    }
+    }*/*/
 }
 
 fn repl(thread: &mut SchemeThread) {
@@ -122,7 +190,7 @@ fn repl(thread: &mut SchemeThread) {
                 }
                 let p = cc.end(thread, 0, false);
                 cc.clear();
-                match waffle::vm::apply(thread, Value::new(p), &[]) {
+                match waffle::runtime::vm::apply(thread, Value::new(p), &[]) {
                     Ok(x) => {
                         println!("{}", x);
                     }
