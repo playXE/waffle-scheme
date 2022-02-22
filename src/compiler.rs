@@ -1514,14 +1514,33 @@ pub fn env_lookup(
         if let Some(val) = val {
             if env_globalp(thread, env) {
                 let module = if search_exports {
-                    let p = thread
-                        .runtime
-                        .global_symbol(crate::runtime::Global::ExportParent);
-                    env.get(Value::new(p))
-                        .unwrap_or_else(|| Value::encode_null_value())
+                    loop {
+                        if val.symbolp() {
+                            let sym = val.downcast::<ScmSymbol>();
+                            if sym.module.tablep() {
+                                break sym.module;
+                            }
+                        }
+                        let p = thread
+                            .runtime
+                            .global_symbol(crate::runtime::Global::ExportParent);
+                        break env
+                            .get(Value::new(p))
+                            .unwrap_or_else(|| Value::encode_null_value());
+                    }
                 } else {
-                    Value::new(env)
+                    if val.symbolp() {
+                        let sym = val.downcast::<ScmSymbol>();
+                        if sym.module.tablep() {
+                            sym.module
+                        } else {
+                            Value::new(env)
+                        }
+                    } else {
+                        Value::new(env)
+                    }
                 };
+
                 return Some(Lookup::Global { value: val, module });
             } else {
                 let up = Value::new(start_env) != Value::new(env);
@@ -1537,28 +1556,7 @@ pub fn env_lookup(
                     up,
                 });
             }
-        } /*else if env_globalp(thread, env) {
-              let rt = thread.runtime;
-              for module in rt.inner().qualified_imports.iter() {
-                  let module = module.table();
-
-                  let exports = thread
-                      .runtime
-                      .global_symbol(crate::runtime::Global::Exports);
-                  if let Some(exports) = module.get(Value::new(exports)) {
-                      if exports.tablep() {
-                          let table = exports.table();
-
-                          if let Some(val) = table.get(Value::new(key)) {
-                              return Some(Lookup::Global {
-                                  value: val,
-                                  module: Value::new(module),
-                              });
-                          }
-                      }
-                  }
-              }
-          }*/
+        }
         level += 1;
 
         let parent = thread.runtime.global_symbol(crate::runtime::Global::Parent);
@@ -1587,6 +1585,7 @@ pub fn env_lookup(
                 .table()
                 .get(Value::new(exports))
                 .unwrap();
+
             if let Some(lookup) = env_lookup(thread, exports.table(), key, true) {
                 return Some(lookup);
             }

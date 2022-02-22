@@ -7,8 +7,11 @@ use self::{
     vm::VMStack,
 };
 use crate::{
-    compiler::make_env, init::enable_core, method_jit::MethodJIT, runtime::value::Closure, Heap,
-    Managed,
+    compiler::make_env,
+    init::enable_core,
+    method_jit::MethodJIT,
+    runtime::{value::Closure, vm::apply},
+    Heap, Managed,
 };
 use comet::{
     api::Trace,
@@ -125,6 +128,7 @@ pub(crate) struct RtInner {
     pub(crate) core_module: Option<Managed<ScmTable>>,
     pub(crate) user_module: Option<Managed<ScmTable>>,
     pub(crate) symbol_table: Option<Managed<ScmTable>>,
+    pub(crate) import_bindings: Option<Managed<ScmTable>>,
     pub(crate) modules: Option<Managed<ScmTable>>,
     pub(crate) globals: Vec<Managed<ScmSymbol>>,
     pub(crate) module_search_paths: Vec<std::string::String>,
@@ -197,6 +201,7 @@ impl Runtime {
             inner: NonNull::new(Box::into_raw(Box::new(RtInner {
                 core_module: None,
                 user_module: None,
+                import_bindings: None,
                 symbol_table: None,
                 globals: vec![],
                 dump_jit,
@@ -229,6 +234,7 @@ impl Runtime {
         };
 
         rt.inner().threads.push(thread.clone());
+        //  rt.inner().import_bindings = Some(make_table(&mut thread, 4));
         rt.inner().symbol_table = Some(make_table(&mut thread, 8));
         for sym in GLOBAL_SYMBOLS.iter() {
             let v = make_symbol(&mut thread, sym);
@@ -370,6 +376,7 @@ impl Runtime {
                     ScmSymbol {
                         name: cpy,
                         mutable: true,
+                        module: Value::new(Null),
                         value: Value::encode_null_value(),
                         id: ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel), // new unique id for our symbol
                     },
@@ -553,8 +560,12 @@ pub fn env_qualify_name(
         .string();
     let name = format!("{}#{}", module_name.to_string(), name);
 
-    make_symbol(thread, name)
+    let mut sym = make_symbol(thread, name);
+
+    sym.module = Value::new(env);
+    sym
 }
+
 pub fn defun(
     thread: &mut SchemeThread,
     name: &str,
@@ -742,10 +753,10 @@ pub fn load_file(
         Ok(val) => val,
     };
     let stack = thread.mutator.shadow_stack();
-    let mut parser = lexpr::Parser::from_str(&file);
+    let parser = lexpr::Parser::from_str(&file);
     letroot!(
         cc = stack,
-        crate::compiler::Compiler::new(thread, None, None, 0,)
+        crate::bytecompiler::ByteCompiler::new(thread, None, None, 0)
     );
     if module_name.stringp() {
         cc.enter_module(thread, module_name)?;
@@ -759,8 +770,8 @@ pub fn load_file(
             .get(Value::new(tag));
         cc.enter_module(thread, module_name.unwrap())?;
     }
-    let mut x = Value::encode_undefined_value();
-    while let Some(val) = parser.next_value().map_err(|error| {
+
+    /*while let Some(val) = parser.next_value().map_err(|error| {
         let tag = thread.runtime.global_symbol(Global::ScmRead);
         let message = make_string(thread, format!("Failed to read file: '{}'", error));
         Value::new(make_exception(thread, tag, message, Value::new(Null)))
@@ -771,9 +782,10 @@ pub fn load_file(
 
         x = crate::runtime::vm::apply(thread, Value::new(p), &[])?;
         cc.clear();
-    }
+    }*/
 
-    Ok(x)
+    let proto = cc.compile_code(thread, parser)?;
+    apply(thread, Value::new(proto), &[])
 }
 
 pub fn load_module(thread: &mut SchemeThread, name: Managed<ScmString>) -> Result<Value, Value> {

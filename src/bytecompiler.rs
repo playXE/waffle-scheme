@@ -26,6 +26,33 @@ use crate::{
     Heap, Managed,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct State {
+    val: bool,
+    more: bool,
+}
+impl State {
+    pub const fn is_unused(&self) -> bool {
+        !self.val
+    }
+    pub const fn is_final(&self) -> bool {
+        !self.more
+    }
+
+    pub const USED_FINAL: Self = Self {
+        val: true,
+        more: false,
+    };
+    pub const USED_NON_FINAL: Self = Self {
+        val: true,
+        more: true,
+    };
+    pub const NOT_USED_NON_FINAL: Self = Self {
+        val: false,
+        more: true,
+    };
+}
+
 pub struct ByteCompiler {
     parent: Option<*mut ByteCompiler>,
     free_variables: Vec<FreeVariableInfo>,
@@ -69,6 +96,11 @@ impl ByteCompiler {
         self.code.push(Op::Pop);
         self.pop(1);
     }
+    pub fn pop_if_possible(&mut self) {
+        if self.stack != 0 {
+            self.pop_();
+        }
+    }
     pub fn pop(&mut self, n: usize) {
         self.stack = self
             .stack
@@ -78,7 +110,7 @@ impl ByteCompiler {
 
     pub fn variable_set(&mut self, thread: &mut SchemeThread, name: Managed<ScmSymbol>) -> bool {
         if let Some(l) = env_lookup(thread, self.env, Value::new(name), false) {
-            self.generate_set(thread, self.env, &l, Value::new(name));
+            self.generate_set(thread, self.env, &l, Value::new(name), None);
             true
         } else {
             false
@@ -131,7 +163,9 @@ impl ByteCompiler {
                     Lookup::Local { level, .. } => *level -= 1,
                     _ => unreachable!(),
                 }
+
                 self.closure = true;
+
                 unsafe {
                     l.index = (**self.parent.as_mut().unwrap())
                         .register_free_variable(&lookup_copy, name);
@@ -154,6 +188,7 @@ impl ByteCompiler {
         match lookup {
             Lookup::Global { module, .. } => {
                 let name = env_qualify_name(thread, module.table(), name);
+
                 self.global_get(thread, name);
             }
             Lookup::Local { index, up, .. } => {
@@ -173,6 +208,7 @@ impl ByteCompiler {
         env: Managed<ScmTable>,
         lookup: &Lookup,
         name: Value,
+        comptime_set: Option<Value>,
     ) {
         match lookup {
             Lookup::Global { .. } => {
@@ -182,9 +218,13 @@ impl ByteCompiler {
                 while !env_globalp(thread, global) {
                     global = global.get(Value::new(p)).unwrap().table();
                 }
-                let qualified_name = env_qualify_name(thread, global, name);
+                let mut qualified_name = env_qualify_name(thread, global, name);
 
-                self.global_set(thread, qualified_name)
+                if let Some(val) = comptime_set {
+                    qualified_name.value = val;
+                } else {
+                    self.global_set(thread, qualified_name)
+                }
             }
             Lookup::Local { index, up, .. } => {
                 if *up {
@@ -275,7 +315,7 @@ impl ByteCompiler {
         let exporting = self.exporting(thread);
         env_define(thread, self.env, Value::new(name), value, exporting);
 
-        self.generate_set(thread, self.env, &l, Value::new(name));
+        self.generate_set(thread, self.env, &l, Value::new(name), None);
 
         l
     }
@@ -362,9 +402,9 @@ impl ByteCompiler {
         variable_arity: bool,
         nlocals: usize,
         is_closure: &mut bool,
+        new_env: Managed<ScmTable>,
         mut closure: impl FnMut(&mut SchemeThread, &mut ByteCompiler) -> Result<(), E>,
     ) -> Result<Managed<ScmPrototype>, E> {
-        let new_env = make_env(thread, Value::new(self.env), None);
         let mut subcompiler = Self::new(thread, Some(self), Some(new_env), self.depth + 1);
         subcompiler.nlocals += argument_count as u16 + nlocals as u16;
         let stack = thread.mutator.shadow_stack();
@@ -372,8 +412,9 @@ impl ByteCompiler {
 
         match closure(thread, &mut subcompiler) {
             Ok(()) => {
+                *is_closure = subcompiler.closure;
                 let proto = subcompiler.end(thread, argument_count, variable_arity);
-                *is_closure = self.closure;
+
                 Ok(proto)
             }
             Err(e) => Err(e),
@@ -425,17 +466,6 @@ impl ByteCompiler {
         arguments: usize,
         variable_arity: bool,
     ) -> Managed<ScmPrototype> {
-        while self.stack > 1 {
-            self.pop(1);
-            self.code.push(Op::Pop);
-        }
-        if self.stack == 0 {
-            self.code.push(Op::PushNull);
-        } else {
-            self.pop(1);
-        }
-        self.code.push(Op::Return);
-
         let codeblob = make_blob::<Op>(thread, self.code.len());
         let b = Value::new(codeblob);
         for i in 0..self.code.len() {
@@ -587,7 +617,7 @@ impl ByteCompiler {
         let expanded = self.macro_expand_1_step(thread, p, exp)?;
 
         let mut expanded = value_to_lexpr(thread, expanded);
-
+        println!("=> {}", expanded);
         if let Some(cons) = expanded.as_cons_mut() {
             if !cons.car().is_symbol() {
                 return Ok(expanded);
@@ -602,9 +632,16 @@ impl ByteCompiler {
                             if let Some(Lookup::Global { value, .. }) =
                                 env_lookup(thread, self.env, Value::new(key), false)
                             {
-                                if value.is_object() && value.get_object().is::<Macro>() {
+                                let value = if value.symbolp() {
+                                    let sym = value.downcast::<ScmSymbol>();
+                                    sym.value
+                                } else {
+                                    value
+                                };
+                                if value.is_cell::<Macro>() {
                                     let substitute =
                                         self.macro_expand_full(thread, value, elt.cdr())?;
+
                                     Some(substitute)
                                 } else {
                                     None
@@ -628,6 +665,26 @@ impl ByteCompiler {
         Ok(expanded)
     }
 
+    fn unify_import(&mut self, thread: &mut SchemeThread, name: Value) -> Managed<ScmSymbol> {
+        let unqualified = thread
+            .runtime
+            .global_symbol(crate::runtime::Global::UnqualifiedImports);
+        let exports = thread
+            .runtime
+            .global_symbol(crate::runtime::Global::Exports);
+        let env = self.env.get(Value::new(unqualified)).unwrap();
+        for i in 0..env.vector_length() {
+            let module = env.vector_ref(i);
+            let exports = module.table().get(Value::new(exports)).unwrap();
+            if let Some(sym) = exports.table().get(name) {
+                return sym.downcast();
+            }
+        }
+        let name = env_qualify_name(thread, self.env, name);
+
+        name
+    }
+
     pub fn compile_export(
         &mut self,
         thread: &mut SchemeThread,
@@ -643,7 +700,8 @@ impl ByteCompiler {
             let name = l.car();
             if let Some(sym) = name.as_symbol() {
                 let sym = make_symbol(thread, sym);
-                let qualified = env_qualify_name(thread, self.env, Value::new(sym));
+                let qualified = self.unify_import(thread, Value::new(sym));
+
                 exports.set(thread, Value::new(sym), Value::new(qualified));
             }
             lst = l.cdr().as_cons();
@@ -655,29 +713,26 @@ impl ByteCompiler {
         &mut self,
         thread: &mut SchemeThread,
         exp: &lexpr::Value,
-        tail: bool,
+
+        st: State,
     ) -> Result<(), Value> {
         let old_stack_size = self.stack;
-        let mut args = exp.as_cons().unwrap().cdr();
+        let exp = self.expect_cons(thread, exp)?;
+        let mut args = exp.cdr();
         while args.is_cons() {
-            self.compile(thread, args.as_cons().unwrap().car(), false)?;
+            self.compile(thread, args.as_cons().unwrap().car(), State::USED_NON_FINAL)?;
             args = args.as_cons().unwrap().cdr();
         }
         let argc = self.stack - old_stack_size;
-        if tail {
+        self.compile(thread, exp.car(), State::USED_NON_FINAL)?;
+        if st.is_final() {
             self.tail_apply(argc as _);
         } else {
-            self.apply(argc as _)
+            self.apply(argc as _);
+            if st.is_unused() {
+                self.pop_();
+            }
         }
-        Ok(())
-    }
-
-    pub fn compile(
-        &mut self,
-        thread: &mut SchemeThread,
-        exp: &lexpr::Value,
-        tail: bool,
-    ) -> Result<(), Value> {
         Ok(())
     }
 
@@ -881,10 +936,6 @@ impl ByteCompiler {
                                 return Ok(false);
                             }
 
-                            "export" => {
-                                self.compile_export(thread, pair.cdr())?;
-                                return Ok(false);
-                            }
                             "import" => {
                                 self.import(thread, pair.cdr())?;
                                 return Ok(false);
@@ -900,11 +951,548 @@ impl ByteCompiler {
         }
     }
 
+    pub fn compile(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+
+        st: State,
+    ) -> Result<(), Value> {
+        match exp {
+            lexpr::Value::Bool(x) => {
+                if !st.is_unused() {
+                    self.boolean(*x);
+                }
+                Ok(())
+            }
+            lexpr::Value::Char(x) => {
+                if !st.is_unused() {
+                    self.int32(*x as i32);
+                }
+                Ok(())
+            }
+            lexpr::Value::Bytes(bytes) => {
+                if !st.is_unused() {
+                    let mut blob = make_blob::<u8>(thread, bytes.len());
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            blob.as_mut_ptr(),
+                            bytes.len(),
+                        );
+                    }
+                    self.constant(thread, Value::new(blob));
+                }
+                Ok(())
+            }
+            lexpr::Value::Vector(values) => {
+                if !st.is_unused() {
+                    let sym = make_symbol(thread, "#waffle#core#vector");
+
+                    for value in values.iter() {
+                        self.compile(thread, value, State::USED_NON_FINAL)?;
+                    }
+                    self.constant(thread, Value::new(sym));
+                    if st.is_final() {
+                        self.tail_apply(values.len() as _)
+                    } else {
+                        self.apply(values.len() as u16)
+                    }
+                }
+                Ok(())
+            }
+            lexpr::Value::Nil | lexpr::Value::Null => {
+                if !st.is_unused() {
+                    self.null();
+                }
+                Ok(())
+            }
+            lexpr::Value::Number(number) => {
+                if !st.is_unused() {
+                    if let Some(i) = number.as_i64() {
+                        if i as i32 as i64 == i {
+                            self.int32(i as _);
+                        } else {
+                            self.constant(thread, Value::new(i as f64));
+                        }
+                    } else if let Some(f) = number.as_f64() {
+                        self.constant(thread, Value::new(f));
+                    } else {
+                        todo!()
+                    }
+                }
+                Ok(())
+            }
+            lexpr::Value::Symbol(symbol_) => {
+                if !st.is_unused() {
+                    let symbol = make_symbol(thread, symbol_);
+                    if !self.variabe_ref(thread, symbol) {
+                        return Err(
+                            self.syntax_error(thread, format!("variable `{}` not found", symbol_,))
+                        );
+                    }
+                }
+                Ok(())
+            }
+
+            lexpr::Value::Cons(pair) => {
+                let first = pair.car();
+                let rest = pair.cdr();
+                match first {
+                    lexpr::Value::Symbol(name) => match &**name {
+                        "set!" => {
+                            self.compile_set(thread, rest)?;
+                            if !st.is_unused() {
+                                self.null();
+                            }
+                            return Ok(());
+                        }
+
+                        "define" => {
+                            self.compile_define(thread, exp, rest)?;
+                            if !st.is_unused() {
+                                self.null();
+                            }
+                            return Ok(());
+                        }
+                        "export" => {
+                            self.compile_export(thread, pair.cdr())?;
+                            return Ok(());
+                        }
+                        "if" => return self.compile_if(thread, rest, st),
+                        "begin" => return self.compile_begin(thread, rest, st),
+                        "defmacro" => {
+                            let rest = self.expect_cons(thread, rest)?;
+                            let name = rest.car();
+                            let name = if let lexpr::Value::Symbol(x) = name {
+                                make_symbol(thread, x)
+                            } else {
+                                return Err(self.syntax_error(
+                                    thread,
+                                    &format!("expected symbol in defmacro but found {:?}", name),
+                                ));
+                            };
+                            let body = rest.cdr();
+                            self.compile_macro(thread, Value::new(name), body)?;
+                            if !st.is_unused() {
+                                self.null();
+                            }
+                            return Ok(());
+                        }
+                        "quote" | "'" => {
+                            if !st.is_unused() {
+                                let rest = self.expect_cons(thread, pair.cdr())?;
+                                let value = lexpr_to_value(thread, rest.car());
+                                self.constant(thread, value)
+                            }
+                            return Ok(());
+                        }
+                        "lambda" => {
+                            if !st.is_unused() {
+                                let lambda = self.expect_cons(thread, rest)?;
+                                let args = lambda.car();
+                                let body = lambda.cdr();
+                                let mut closure = false;
+                                let f = self.generate_lambda(
+                                    thread,
+                                    Value::new(Null),
+                                    args,
+                                    body,
+                                    &mut closure,
+                                )?;
+                                self.constant(thread, Value::new(f));
+
+                                if closure {
+                                    self.code.push(Op::CloseOver);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        x => {
+                            let sym = make_symbol(thread, x);
+                            let x = env_lookup(thread, self.env, Value::new(sym), false);
+                            if let Some(Lookup::Global { value, .. }) = x {
+                                let value = if value.symbolp() {
+                                    let sym = value.downcast::<ScmSymbol>();
+                                    sym.value
+                                } else {
+                                    value
+                                };
+                                if value.is_cell::<Macro>() {
+                                    let expanded = self.macro_expand_full(thread, value, rest)?;
+                                    self.compile(thread, &expanded, st)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+
+                self.compile_apply(thread, exp, st)
+            }
+            lexpr::Value::String(x) => {
+                if !st.is_unused() {
+                    let str = make_string(thread, x);
+                    self.constant(thread, Value::new(str));
+                }
+                Ok(())
+            }
+            _ => todo!(),
+        }
+    }
+
+    pub fn compile_if(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        st: State,
+    ) -> Result<(), Value> {
+        let exp = self.expect_cons(thread, exp)?;
+        let cond = exp.car();
+        let then_and_else = self.expect_cons(thread, exp.cdr())?;
+        let else_ = self.expect_cons(thread, then_and_else.cdr())?.car();
+        self.compile(thread, cond, State::USED_NON_FINAL)?;
+        self.if_(
+            thread,
+            |thread, cc| cc.compile(thread, then_and_else.car(), st),
+            |thread, cc| cc.compile(thread, else_, st),
+        )
+    }
+
+    pub fn compile_define(
+        &mut self,
+        thread: &mut SchemeThread,
+        original: &lexpr::Value,
+        rest: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let rest = self.expect_cons(thread, rest)?;
+        let value = rest.cdr();
+        let name;
+        match rest.car() {
+            // (define (name arg0 arg1 arg2) body)
+            lexpr::Value::Cons(name_and_args) => {
+                let name_ = self.expect_symbol(thread, name_and_args.car())?;
+                name = make_symbol(thread, name_);
+                let args = name_and_args.cdr();
+                let body = value;
+                let mut closure = false;
+                let lambda =
+                    self.generate_lambda(thread, Value::new(name), args, body, &mut closure)?;
+                if env_globalp(thread, self.env) {
+                    assert!(!closure, "closure cannot be created at top-level");
+                    let l = Lookup::Global {
+                        value: Value::new(Undefined),
+                        module: Value::new(Undefined),
+                    };
+                    let exporting = self.exporting(thread);
+                    env_define(
+                        thread,
+                        self.env,
+                        Value::new(name),
+                        Value::new(name),
+                        exporting,
+                    );
+                    self.generate_set(
+                        thread,
+                        self.env,
+                        &l,
+                        Value::new(name),
+                        Some(Value::new(lambda)),
+                    );
+                } else {
+                    self.constant(thread, Value::new(lambda));
+                    self.code.push(Op::CloseOver);
+                    self.nlocals += 1;
+                    let l = Lookup::Local {
+                        index: self.nlocals as usize - 1,
+                        level: 0,
+                        up: false,
+                        value: Value::new(self.nlocals as i32 - 1),
+                    };
+                    env_define(
+                        thread,
+                        self.env,
+                        Value::new(name),
+                        Value::new(self.nlocals as i32 - 1),
+                        false,
+                    );
+                    self.generate_set(thread, self.env, &l, Value::new(name), None);
+                }
+                return Ok(());
+            }
+            lexpr::Value::Symbol(name_) => {
+                name = make_symbol(thread, name_);
+
+                match rest.cdr() {
+                    lexpr::Value::Cons(pair) => match pair.car() {
+                        lexpr::Value::Cons(pair) => match pair.car() {
+                            lexpr::Value::Symbol(x) => match &**x {
+                                "lambda" => {
+                                    let args_and_body = self.expect_cons(thread, pair.cdr())?;
+                                    let args = args_and_body.car();
+                                    let body = args_and_body.cdr();
+                                    let mut closure = false;
+                                    let lambda = self.generate_lambda(
+                                        thread,
+                                        Value::new(name),
+                                        args,
+                                        body,
+                                        &mut closure,
+                                    )?;
+                                    if env_globalp(thread, self.env) {
+                                        assert!(!closure, "closure cannot be created at top-level");
+                                        let l = Lookup::Global {
+                                            value: Value::new(Undefined),
+                                            module: Value::new(Undefined),
+                                        };
+                                        let exporting = self.exporting(thread);
+                                        env_define(
+                                            thread,
+                                            self.env,
+                                            Value::new(name),
+                                            Value::new(name),
+                                            exporting,
+                                        );
+                                        self.generate_set(
+                                            thread,
+                                            self.env,
+                                            &l,
+                                            Value::new(name),
+                                            Some(Value::new(lambda)),
+                                        );
+                                    } else {
+                                        self.constant(thread, Value::new(lambda));
+                                        self.code.push(Op::CloseOver);
+                                        self.nlocals += 1;
+                                        let l = Lookup::Local {
+                                            index: self.nlocals as usize - 1,
+                                            level: 0,
+                                            up: false,
+                                            value: Value::new(self.nlocals as i32 - 1),
+                                        };
+                                        env_define(
+                                            thread,
+                                            self.env,
+                                            Value::new(name),
+                                            Value::new(self.nlocals as i32 - 1),
+                                            false,
+                                        );
+                                        self.generate_set(
+                                            thread,
+                                            self.env,
+                                            &l,
+                                            Value::new(name),
+                                            None,
+                                        );
+                                    }
+                                    return Ok(());
+                                }
+                                _ => (),
+                            },
+                            _ => (),
+                        },
+                        _ => (),
+                    },
+                    _ => (),
+                };
+                let value;
+                let l = if env_globalp(thread, self.env) {
+                    value = Value::new(name);
+                    Lookup::Global {
+                        value: Value::new(Undefined),
+                        module: Value::new(Undefined),
+                    }
+                } else {
+                    value = Value::new(self.nlocals as i32);
+                    self.nlocals += 1;
+                    Lookup::Local {
+                        index: self.nlocals as usize - 1,
+                        level: 0,
+                        up: false,
+                        value: Value::new(self.nlocals as i32 - 1),
+                    }
+                };
+                let rest = self.expect_cons(thread, rest.cdr())?;
+                self.compile(thread, rest.car(), State::USED_NON_FINAL)?;
+                let exporting = self.exporting(thread);
+                env_define(thread, self.env, Value::new(name), value, exporting);
+                self.generate_set(thread, self.env, &l, Value::new(name), None);
+                Ok(())
+            }
+
+            _ => {
+                return Err(self.syntax_error(
+                    thread,
+                    format!("failed to match any pattern in form {}", original),
+                ))
+            }
+        }
+    }
+    pub fn generate_lambda(
+        &mut self,
+        thread: &mut SchemeThread,
+        name: Value,
+        mut args: &lexpr::Value,
+        body: &lexpr::Value,
+        closure: &mut bool,
+    ) -> Result<Managed<ScmPrototype>, Value> {
+        let new_env = make_env(thread, Value::new(self.env), None);
+        let mut variable_arity = false;
+        let mut argc = 0i32;
+
+        if let lexpr::Value::Symbol(ref x) = args {
+            let arg = make_symbol(thread, x);
+            env_define(thread, new_env, Value::new(arg), Value::new(argc), false);
+
+            argc += 1;
+            variable_arity = true;
+        } else if args.is_cons() {
+            while args.is_cons() {
+                let args_ = args.as_cons().unwrap();
+                let arg = args_.car();
+
+                if !arg.is_symbol() {
+                    return Err(self.syntax_error(
+                        thread,
+                        format!("lambda expects symbol as argument name, got '{:?}'", args),
+                    ));
+                }
+
+                let arg = make_symbol(thread, arg.as_symbol().unwrap());
+
+                env_define(thread, new_env, Value::new(arg), Value::new(argc), false);
+                argc += 1;
+                let rest = args_.cdr();
+                if rest.is_symbol() {
+                    let arg = make_symbol(thread, rest.as_symbol().unwrap());
+                    env_define(thread, new_env, Value::new(arg), Value::new(argc), false);
+                    argc += 1;
+                    variable_arity = true;
+                    break;
+                } else {
+                    args = rest;
+                }
+            }
+        } else if args.is_null() {
+        } else {
+            return Err(self.syntax_error(
+                thread,
+                format!("lambda expects () or symbol, got '{:?}'", args),
+            ));
+        }
+        self.enter_parent(
+            thread,
+            argc as _,
+            variable_arity,
+            0,
+            closure,
+            new_env,
+            |thread, cc| {
+                if !name.is_null() {
+                    cc.name = Some(name.symbol_name());
+                }
+
+                cc.compile_begin(thread, body, State::USED_FINAL)?;
+                cc.code.push(Op::Return);
+
+                Ok(())
+            },
+        )
+    }
+    pub fn compile_begin(
+        &mut self,
+        thread: &mut SchemeThread,
+        exp: &lexpr::Value,
+        st: State,
+    ) -> Result<(), Value> {
+        if exp.is_null() {
+            if !st.is_unused() {
+                self.null();
+            }
+            return Ok(());
+        }
+
+        match exp.as_cons() {
+            Some(cons) => {
+                if cons.cdr().is_null() {
+                    self.compile(thread, cons.car(), st)?;
+                    Ok(())
+                } else {
+                    self.compile(thread, cons.car(), State::NOT_USED_NON_FINAL)?;
+
+                    self.compile_begin(thread, cons.cdr(), st)
+                }
+            }
+            None => Err(self.syntax_error(
+                thread,
+                &format!(
+                    "Unexpected value passed to begin block instead of a cons: {}",
+                    exp
+                ),
+            )),
+        }
+    }
+
+    pub fn compile_macro(
+        &mut self,
+        thread: &mut SchemeThread,
+        name: Value,
+        lambda: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let exporting = self.exporting(thread);
+        let mut closure = false;
+        let args_and_body = self.expect_cons(thread, lambda)?;
+        let args = args_and_body.car();
+        let body = args_and_body.cdr();
+        let mut env = self.env;
+        let parent = thread.runtime.global_symbol(crate::runtime::Global::Parent);
+        while !env_globalp(thread, env) {
+            env = env.get(Value::new(parent)).unwrap().table();
+        }
+        let mut qualified_name = env_qualify_name(thread, env, name);
+        let proto = self.generate_lambda(thread, name, args, body, &mut closure)?;
+
+        let proto = thread.mutator.allocate(
+            Macro {
+                p: Value::new(proto),
+            },
+            comet::gc_base::AllocationSpace::New,
+        );
+        env_define(thread, env, Value::new(name), Value::new(proto), exporting);
+        env_define(
+            thread,
+            env,
+            Value::new(qualified_name),
+            Value::new(proto),
+            exporting,
+        );
+        qualified_name.value = Value::new(proto);
+        Ok(())
+    }
+    pub fn compile_set(
+        &mut self,
+        thread: &mut SchemeThread,
+        rest: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let rest = self.expect_cons(thread, rest)?;
+        let name = self.expect_symbol(thread, rest.car())?;
+        let name = make_symbol(thread, name);
+        let value = self.expect_cons(thread, rest.cdr())?.car();
+
+        self.compile(thread, value, State::USED_NON_FINAL)?;
+        if !self.variable_set(thread, name) {
+            Err(self.syntax_error(thread, format!("variable `{}` not found", Value::new(name))))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn compile_code<'a, R>(
         &mut self,
         thread: &mut SchemeThread,
         mut parser: lexpr::Parser<R>,
-    ) -> Result<(), Value>
+    ) -> Result<Managed<ScmPrototype>, Value>
     where
         R: lexpr::parse::Read<'a>,
     {
@@ -935,8 +1523,23 @@ impl ByteCompiler {
         // in 2) we walk all expressions, compile them and at the same time expand macros.
         // I could try to make macro expansion pass but it is too complex for my brain so we just expand them
         // as we compile code
-        // TBD
+        for (i, expr) in to_be_compiled.iter().enumerate() {
+            let is_last = i == to_be_compiled.len() - 1;
 
-        Ok(())
+            self.compile(
+                thread,
+                expr,
+                if is_last {
+                    State::USED_NON_FINAL
+                } else {
+                    State::NOT_USED_NON_FINAL
+                },
+            )?;
+        }
+
+        self.code.push(Op::Return);
+        //self.pop(1);
+
+        Ok(self.end(thread, 0, false))
     }
 }

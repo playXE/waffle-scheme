@@ -579,6 +579,7 @@ pub struct ScmSymbol {
     pub id: u64,
     pub name: Value,
     pub value: Value,
+    pub(crate) module: Value,
     pub(crate) mutable: bool,
 }
 
@@ -724,6 +725,7 @@ unsafe impl Trace for ScmSymbol {
     fn trace(&mut self, _vis: &mut dyn Visitor) {
         self.name.trace(_vis);
         self.value.trace(_vis);
+        self.module.trace(_vis);
     }
 }
 

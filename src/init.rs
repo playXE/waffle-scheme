@@ -710,6 +710,7 @@ fn init_core(thread: &mut SchemeThread) {
                 name: Value::new(cpy),
                 id,
                 value: Value::new(Null),
+                module: Value::new(Null),
                 mutable: true,
             };
             Ok(Value::new(
