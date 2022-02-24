@@ -5,315 +5,532 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use crate::{compiler::Op, method_jit::lower::FunctionLowerer, Heap, *};
+use crate::{
+    compiler::Op,
+    jit::{bc2lbc::BC2LBC, lbc::LBCBlock},
+    Heap, *,
+};
 use comet::{api::*, gc_base::AllocationSpace, mutator::MutatorRef};
 use comet_extra::alloc::{array::Array, hash::HashMap, string::String, vector::Vector};
 
 use super::{make_exception, make_string, make_vector, SchemeThread};
 
-pub type TagKind = u32;
+#[cfg(target_pointer_width = "64")]
+pub mod new_value {
+    use comet::api::{Collectable, HeapObjectHeader};
 
-pub const FIRST_TAG: TagKind = 0xfff9;
-pub const LAST_TAG: TagKind = 0xffff;
-pub const EMPTY_INVALID_TAG: u32 = FIRST_TAG;
-pub const UNDEFINED_NULL_TAG: u32 = FIRST_TAG + 1;
-pub const BOOL_TAG: u32 = FIRST_TAG + 2;
-pub const INT32_TAG: u32 = FIRST_TAG + 3;
-pub const NATIVE_VALUE_TAG: u32 = FIRST_TAG + 4;
-pub const STR_TAG: u32 = FIRST_TAG + 5;
-pub const OBJECT_TAG: u32 = FIRST_TAG + 6;
-pub const FIRST_PTR_TAG: u32 = STR_TAG;
+    use crate::Managed;
 
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExtendedTag {
-    Empty = EMPTY_INVALID_TAG * 2 + 1,
-    Undefined = UNDEFINED_NULL_TAG * 2,
-    Null = UNDEFINED_NULL_TAG * 2 + 1,
-    Bool = BOOL_TAG * 2,
-    Int32 = INT32_TAG * 2,
-    Native1 = NATIVE_VALUE_TAG * 2,
-    Native2 = NATIVE_VALUE_TAG * 2 + 1,
-    Str1 = STR_TAG * 2,
-    Str2 = STR_TAG * 2 + 1,
-    Object1 = OBJECT_TAG * 2,
-    Object2 = OBJECT_TAG * 2 + 1,
+    #[derive(Clone, Copy)]
+    #[repr(transparent)]
+    pub struct Value(pub(crate) EncodedValueDescriptor);
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub(crate) union EncodedValueDescriptor {
+        as_int64: i64,
+        ptr: usize,
+    }
+
+    impl PartialEq for Value {
+        fn eq(&self, other: &Self) -> bool {
+            unsafe { self.0.as_int64 == other.0.as_int64 }
+        }
+    }
+
+    impl Eq for Value {}
+    /// Returns some kind of pure NaN.
+    #[inline(always)]
+    pub fn pure_nan() -> f64 {
+        f64::from_bits(0x7ff8000000000000)
+    }
+
+    #[inline]
+    pub fn is_impure_nan(value: f64) -> bool {
+        // Tests if the double value would break JSVALUE64 encoding, which is the most
+        // aggressive kind of encoding that we currently use.
+        value.to_bits() >= 0xfffe000000000000
+    }
+    /// If the given value is NaN then return a NaN that is known to be pure.
+    pub fn purify_nan(value: f64) -> f64 {
+        if value != value {
+            return pure_nan();
+        }
+        value
+    }
+    impl Value {
+        pub const DOUBLE_ENCODE_OFFSET_BIT: usize = 49;
+        pub const DOUBLE_ENCODE_OFFSET: i64 = 1 << Self::DOUBLE_ENCODE_OFFSET_BIT as i64;
+        pub const NUMBER_TAG: i64 = 0xfffe000000000000u64 as i64;
+        pub const LOWEST_OF_HIGH_BITS: i64 = 1 << 49;
+
+        pub const OTHER_TAG: i32 = 0x2;
+        pub const BOOL_TAG: i32 = 0x4;
+        pub const UNDEFINED_TAG: i32 = 0x8;
+        pub const NATIVE32_TAG: i32 = 0x12;
+        pub const NATIVE32_MASK: i64 = Self::NUMBER_TAG | Self::NATIVE32_TAG as i64;
+
+        pub const VALUE_FALSE: i32 = Self::OTHER_TAG | Self::BOOL_TAG | false as i32;
+        pub const VALUE_TRUE: i32 = Self::OTHER_TAG | Self::BOOL_TAG | true as i32;
+        pub const VALUE_UNDEFINED: i32 = Self::OTHER_TAG | Self::UNDEFINED_TAG;
+        pub const VALUE_NULL: i32 = Self::OTHER_TAG;
+
+        pub const MISC_TAG: i64 =
+            Self::OTHER_TAG as i64 | Self::BOOL_TAG as i64 | Self::UNDEFINED_TAG as i64;
+        pub const NOT_CELL_MASK: i64 = Self::NUMBER_TAG as i64 | Self::OTHER_TAG as i64;
+
+        pub const VALUE_EMPTY: i64 = 0x0;
+        pub const VALUE_DELETED: i64 = 0x4;
+
+        pub const UNDEFINED: Value = Self::encode_undefined_value();
+
+        #[inline]
+        pub fn encode_empty_value() -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: Self::VALUE_EMPTY,
+            })
+        }
+        #[inline]
+        pub fn encode_object_value<T: Collectable + ?Sized>(gc: Managed<T>) -> Self {
+            Self(EncodedValueDescriptor {
+                ptr: unsafe { std::mem::transmute(gc) },
+            })
+        }
+
+        #[inline]
+        pub fn encode_object_value_raw(gc: *mut HeapObjectHeader) -> Self {
+            Self(EncodedValueDescriptor { ptr: gc as _ })
+        }
+
+        #[inline]
+        pub const fn encode_undefined_value() -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: Self::VALUE_UNDEFINED as _,
+            })
+        }
+
+        #[inline]
+        pub const fn encode_null_value() -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: Self::VALUE_NULL as _,
+            })
+        }
+
+        #[inline]
+        pub fn encode_bool_value(x: bool) -> Self {
+            if x {
+                Self(EncodedValueDescriptor {
+                    as_int64: Self::VALUE_TRUE as _,
+                })
+            } else {
+                Self(EncodedValueDescriptor {
+                    as_int64: Self::VALUE_FALSE as _,
+                })
+            }
+        }
+        #[inline]
+        pub fn is_empty(self) -> bool {
+            unsafe { self.0.as_int64 == Self::VALUE_EMPTY }
+        }
+
+        #[inline]
+        pub fn is_undefined(self) -> bool {
+            self == Self::encode_undefined_value()
+        }
+        #[inline]
+        pub fn is_null(self) -> bool {
+            self == Self::encode_null_value()
+        }
+
+        #[inline]
+        pub fn is_true(self) -> bool {
+            self == Self::encode_bool_value(true)
+        }
+
+        #[inline]
+        pub fn is_false(self) -> bool {
+            self == Self::encode_bool_value(false)
+        }
+
+        #[inline]
+        pub fn is_boolean(self) -> bool {
+            unsafe { (self.0.as_int64 & !1) == Self::VALUE_FALSE as i64 }
+        }
+
+        #[inline]
+        pub fn is_pointer(self) -> bool {
+            unsafe { (self.0.as_int64 & Self::NOT_CELL_MASK) == 0 }
+        }
+
+        #[inline]
+        pub fn is_int32(self) -> bool {
+            unsafe { (self.0.as_int64 & Self::NUMBER_TAG) == Self::NUMBER_TAG }
+        }
+
+        #[inline]
+        pub fn is_number(self) -> bool {
+            unsafe { (self.0.as_int64 & Self::NUMBER_TAG) != 0 }
+        }
+
+        #[inline]
+        pub fn get_object(self) -> Managed<dyn Collectable> {
+            assert!(self.is_object());
+
+            unsafe { std::mem::transmute(self.0.ptr) }
+        }
+        #[inline]
+        pub fn get_object_raw(self) -> *mut HeapObjectHeader {
+            unsafe { self.0.ptr as _ }
+        }
+
+        #[inline]
+        pub fn is_object(self) -> bool {
+            self.is_pointer() && !self.is_empty()
+        }
+        #[inline]
+        pub fn get_int32(self) -> i32 {
+            unsafe { self.0.as_int64 as i32 }
+        }
+
+        #[inline]
+        pub fn get_number(self) -> f64 {
+            if self.is_int32() {
+                return self.get_int32() as _;
+            }
+            self.get_double()
+        }
+        #[inline]
+        pub fn get_double(self) -> f64 {
+            assert!(self.is_double());
+            f64::from_bits((unsafe { self.0.as_int64 - Self::DOUBLE_ENCODE_OFFSET }) as u64)
+        }
+        #[inline]
+        pub fn is_double(self) -> bool {
+            self.is_number() && !self.is_int32()
+        }
+
+        #[inline]
+        pub fn is_bool(self) -> bool {
+            unsafe { (self.0.as_int64 & !1) == Self::VALUE_FALSE as i64 }
+        }
+
+        #[inline]
+        pub fn encode_f64_value(x: f64) -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: x.to_bits() as i64 + Self::DOUBLE_ENCODE_OFFSET,
+            })
+        }
+
+        #[inline]
+        pub fn encode_untrusted_f64_value(x: f64) -> Self {
+            Self::encode_f64_value(purify_nan(x))
+        }
+
+        #[inline]
+        pub fn encode_nan_value() -> Self {
+            Self::encode_f64_value(pure_nan())
+        }
+
+        #[inline]
+        pub fn encode_int32(x: i32) -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: Self::NUMBER_TAG | x as u32 as u64 as i64,
+            })
+        }
+
+        #[inline]
+        pub fn get_raw(self) -> u64 {
+            unsafe { self.0.as_int64 as u64 }
+        }
+
+        #[inline]
+        pub fn get_native_u32(self) -> u32 {
+            unsafe { (self.0.as_int64 >> 16) as u32 }
+        }
+
+        #[inline]
+        pub fn encode_native_u32(x: u32) -> Self {
+            Self(EncodedValueDescriptor {
+                as_int64: (((x as u64) << 16) | Self::NATIVE32_TAG as u64) as i64,
+            })
+        }
+        #[inline]
+        pub fn is_native_value(self) -> bool {
+            unsafe { (self.0.as_int64 & Self::NATIVE32_MASK) == Self::NATIVE32_TAG as i64 }
+        }
+
+        #[inline]
+        pub fn get_bool(self) -> bool {
+            assert!(self.is_bool());
+            self == Self::encode_bool_value(true)
+        }
+    }
 }
 
-/// A NaN-boxed encoded value.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct Value(u64);
+#[cfg(target_pointer_width = "32")]
+pub mod old_value {
+    use super::*;
+    pub type TagKind = u32;
 
-impl Value {
-    pub const NUM_TAG_EXP_BITS: u32 = 16;
-    pub const NUM_DATA_BITS: u32 = (64 - Self::NUM_TAG_EXP_BITS);
-    pub const TAG_WIDTH: u32 = 4;
-    pub const TAG_MASK: u32 = (1 << Self::TAG_WIDTH) - 1;
-    pub const DATA_MASK: u64 = (1 << Self::NUM_DATA_BITS as u64) - 1;
-    pub const ETAG_WIDTH: u32 = 5;
-    pub const ETAG_MASK: u32 = (1 << Self::ETAG_WIDTH) - 1;
-    #[inline]
-    pub const fn from_raw(x: u64) -> Self {
-        Self(x)
-    }
-    #[inline]
-    pub const fn get_tag(&self) -> TagKind {
-        (self.0 >> Self::NUM_DATA_BITS as u64) as u32
-    }
-    #[inline]
-    pub fn get_etag(&self) -> ExtendedTag {
-        unsafe { std::mem::transmute((self.0 >> (Self::NUM_DATA_BITS as u64 - 1)) as u32) }
-    }
-    #[inline]
-    pub const fn combine_tags(a: TagKind, b: TagKind) -> u32 {
-        ((a & Self::TAG_MASK) << Self::TAG_WIDTH) | (b & Self::TAG_MASK)
-    }
-    #[inline]
-    const fn internal_new(val: u64, tag: TagKind) -> Self {
-        Self(val | ((tag as u64) << Self::NUM_DATA_BITS))
-    }
-    #[inline]
-    const fn new_extended(val: u64, tag: ExtendedTag) -> Self {
-        Self(val | ((tag as u64) << (Self::NUM_DATA_BITS - 1)))
-    }
-    #[inline]
-    pub const fn encode_null_ptr_object_value() -> Self {
-        Self::internal_new(0, OBJECT_TAG)
-    }
-    #[inline]
-    pub fn encode_object_value<T: Collectable + ?Sized>(val: Managed<T>) -> Self {
-        Self::internal_new(
-            unsafe { std::mem::transmute::<_, usize>(val) } as _,
-            OBJECT_TAG,
-        )
+    pub const FIRST_TAG: TagKind = 0xfff9;
+    pub const LAST_TAG: TagKind = 0xffff;
+    pub const EMPTY_INVALID_TAG: u32 = FIRST_TAG;
+    pub const UNDEFINED_NULL_TAG: u32 = FIRST_TAG + 1;
+    pub const BOOL_TAG: u32 = FIRST_TAG + 2;
+    pub const INT32_TAG: u32 = FIRST_TAG + 3;
+    pub const NATIVE_VALUE_TAG: u32 = FIRST_TAG + 4;
+    pub const STR_TAG: u32 = FIRST_TAG + 5;
+    pub const OBJECT_TAG: u32 = FIRST_TAG + 6;
+    pub const FIRST_PTR_TAG: u32 = STR_TAG;
+
+    #[repr(u32)]
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum ExtendedTag {
+        Empty = EMPTY_INVALID_TAG * 2 + 1,
+        Undefined = UNDEFINED_NULL_TAG * 2,
+        Null = UNDEFINED_NULL_TAG * 2 + 1,
+        Bool = BOOL_TAG * 2,
+        Int32 = INT32_TAG * 2,
+        Native1 = NATIVE_VALUE_TAG * 2,
+        Native2 = NATIVE_VALUE_TAG * 2 + 1,
+        Str1 = STR_TAG * 2,
+        Str2 = STR_TAG * 2 + 1,
+        Object1 = OBJECT_TAG * 2,
+        Object2 = OBJECT_TAG * 2 + 1,
     }
 
-    #[inline]
-    pub fn encode_object_value_raw(val: *mut HeapObjectHeader) -> Self {
-        Self::internal_new(
-            unsafe { std::mem::transmute::<_, usize>(val) } as _,
-            OBJECT_TAG,
-        )
-    }
-    #[inline]
-    pub const fn encode_native_u32(val: u32) -> Self {
-        Self::internal_new(val as _, NATIVE_VALUE_TAG)
-    }
-    #[inline]
-    pub fn encode_native_pointer(p: *const ()) -> Self {
-        Self::internal_new(p as _, NATIVE_VALUE_TAG)
-    }
-    #[inline]
-    pub const fn encode_bool_value(val: bool) -> Self {
-        Self::internal_new(val as _, BOOL_TAG)
-    }
-    #[inline]
-    pub const fn encode_null_value() -> Self {
-        Self::new_extended(0, ExtendedTag::Null)
-    }
-    #[inline]
-    pub fn encode_int32(x: i32) -> Self {
-        Self::internal_new(x as u32 as u64, INT32_TAG)
-    }
-    #[inline]
-    pub const fn encode_undefined_value() -> Self {
-        Self::new_extended(0, ExtendedTag::Undefined)
-    }
-    #[inline]
-    pub const fn encode_empty_value() -> Self {
-        Self::new_extended(0, ExtendedTag::Empty)
-    }
-    #[inline]
-    pub fn encode_f64_value(x: f64) -> Self {
-        Self::from_raw(x.to_bits())
-    }
+    /// A NaN-boxed encoded value.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Value(pub(crate) u64);
 
-    #[inline]
-    pub const fn encode_nan_value() -> Self {
-        Self::from_raw(0x7ff8000000000000)
-    }
-    #[inline]
-    pub fn encode_untrusted_f64_value(val: f64) -> Self {
-        if val.is_nan() {
-            return Self::encode_nan_value();
+    impl Value {
+        pub const NUM_TAG_EXP_BITS: u32 = 16;
+        pub const NUM_DATA_BITS: u32 = (64 - Self::NUM_TAG_EXP_BITS);
+        pub const TAG_WIDTH: u32 = 4;
+        pub const TAG_MASK: u32 = (1 << Self::TAG_WIDTH) - 1;
+        pub const DATA_MASK: u64 = (1 << Self::NUM_DATA_BITS as u64) - 1;
+        pub const ETAG_WIDTH: u32 = 5;
+        pub const ETAG_MASK: u32 = (1 << Self::ETAG_WIDTH) - 1;
+        #[inline]
+        pub const fn from_raw(x: u64) -> Self {
+            Self(x)
         }
-        Self::encode_f64_value(val)
-    }
-
-    #[inline]
-    pub fn update_pointer(&self, val: *const ()) -> Self {
-        Self::internal_new(val as _, self.get_tag())
-    }
-
-    #[inline]
-    pub unsafe fn unsafe_update_pointer(&mut self, val: *const ()) {
-        self.0 = val as u64 | (self.get_tag() as u64) << Self::NUM_DATA_BITS as u64
-    }
-
-    #[inline]
-    pub fn is_null(&self) -> bool {
-        self.get_etag() == ExtendedTag::Null
-    }
-    #[inline]
-    pub fn is_undefined(&self) -> bool {
-        self.get_etag() == ExtendedTag::Undefined
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.get_etag() == ExtendedTag::Empty
-    }
-
-    #[inline]
-    pub fn is_native_value(&self) -> bool {
-        self.get_tag() == NATIVE_VALUE_TAG
-    }
-
-    #[inline]
-    pub fn is_int32(&self) -> bool {
-        self.get_tag() == INT32_TAG
-    }
-
-    #[inline]
-    pub fn is_bool(&self) -> bool {
-        self.get_tag() == BOOL_TAG
-    }
-
-    #[inline]
-    pub fn is_object(&self) -> bool {
-        self.get_tag() == OBJECT_TAG
-    }
-
-    #[inline]
-    pub fn is_double(&self) -> bool {
-        self.0 < ((FIRST_TAG as u64) << Self::NUM_DATA_BITS as u64)
-    }
-
-    #[inline]
-    pub fn is_pointer(&self) -> bool {
-        self.0 >= ((FIRST_PTR_TAG as u64) << Self::NUM_DATA_BITS as u64)
-    }
-
-    #[inline]
-    pub fn get_raw(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub fn get_pointer(&self) -> *mut () {
-        assert!(self.is_pointer());
-        unsafe { std::mem::transmute((self.0 & Self::DATA_MASK) as usize) }
-    }
-    #[inline]
-    pub fn get_int32(&self) -> i32 {
-        assert!(self.is_int32());
-        self.0 as u32 as i32
-    }
-    #[inline]
-    pub fn get_double(&self) -> f64 {
-        f64::from_bits(self.0)
-    }
-    #[inline]
-    pub fn get_native_value(&self) -> i64 {
-        assert!(self.is_native_value());
-        (((self.0 & Self::DATA_MASK as u64) as i64) << (64 - Self::NUM_DATA_BITS as i64))
-            >> (64 - Self::NUM_DATA_BITS as i64)
-    }
-
-    #[inline]
-    pub fn get_native_u32(&self) -> u32 {
-        assert!(self.is_native_value());
-        self.0 as u32
-    }
-
-    #[inline]
-    pub fn get_native_ptr(&self) -> *mut () {
-        assert!(self.is_native_value());
-        (self.0 & Self::DATA_MASK) as *mut ()
-    }
-
-    #[inline]
-    pub fn get_bool(&self) -> bool {
-        assert!(self.is_bool());
-        (self.0 & 0x1) != 0
-    }
-
-    #[inline]
-    pub fn get_object(&self) -> Managed<dyn Collectable> {
-        assert!(self.is_object());
-        unsafe { std::mem::transmute::<_, _>((self.0 & Self::DATA_MASK) as usize) }
-    }
-    #[inline]
-    pub fn get_object_raw(&self) -> *mut HeapObjectHeader {
-        assert!(self.is_object());
-        unsafe { std::mem::transmute::<_, _>((self.0 & Self::DATA_MASK) as usize) }
-    }
-
-    /// Get number value from JS value.If value is int32 value then it is casted to f64.
-    #[inline]
-    pub fn get_number(&self) -> f64 {
-        if self.is_int32() {
-            return self.get_int32() as f64;
+        #[inline]
+        pub const fn get_tag(&self) -> TagKind {
+            (self.0 >> Self::NUM_DATA_BITS as u64) as u32
         }
-        self.get_double()
-    }
+        #[inline]
+        pub fn get_etag(&self) -> ExtendedTag {
+            unsafe { std::mem::transmute((self.0 >> (Self::NUM_DATA_BITS as u64 - 1)) as u32) }
+        }
+        #[inline]
+        pub const fn combine_tags(a: TagKind, b: TagKind) -> u32 {
+            ((a & Self::TAG_MASK) << Self::TAG_WIDTH) | (b & Self::TAG_MASK)
+        }
+        #[inline]
+        const fn internal_new(val: u64, tag: TagKind) -> Self {
+            Self(val | ((tag as u64) << Self::NUM_DATA_BITS))
+        }
+        #[inline]
+        const fn new_extended(val: u64, tag: ExtendedTag) -> Self {
+            Self(val | ((tag as u64) << (Self::NUM_DATA_BITS - 1)))
+        }
+        #[inline]
+        pub const fn encode_null_ptr_object_value() -> Self {
+            Self::internal_new(0, OBJECT_TAG)
+        }
+        #[inline]
+        pub fn encode_object_value<T: Collectable + ?Sized>(val: Managed<T>) -> Self {
+            Self::internal_new(
+                unsafe { std::mem::transmute::<_, usize>(val) } as _,
+                OBJECT_TAG,
+            )
+        }
 
-    pub unsafe fn set_no_barrier(&mut self, val: Self) {
-        self.0 = val.0;
-    }
+        #[inline]
+        pub fn encode_object_value_raw(val: *mut HeapObjectHeader) -> Self {
+            Self::internal_new(
+                unsafe { std::mem::transmute::<_, usize>(val) } as _,
+                OBJECT_TAG,
+            )
+        }
+        #[inline]
+        pub const fn encode_native_u32(val: u32) -> Self {
+            Self::internal_new(val as _, NATIVE_VALUE_TAG)
+        }
+        #[inline]
+        pub fn encode_native_pointer(p: *const ()) -> Self {
+            Self::internal_new(p as _, NATIVE_VALUE_TAG)
+        }
+        #[inline]
+        pub const fn encode_bool_value(val: bool) -> Self {
+            Self::internal_new(val as _, BOOL_TAG)
+        }
+        #[inline]
+        pub const fn encode_null_value() -> Self {
+            Self::new_extended(0, ExtendedTag::Null)
+        }
+        #[inline]
+        pub fn encode_int32(x: i32) -> Self {
+            Self::internal_new(x as u32 as u64, INT32_TAG)
+        }
+        #[inline]
+        pub const fn encode_undefined_value() -> Self {
+            Self::new_extended(0, ExtendedTag::Undefined)
+        }
+        #[inline]
+        pub const fn encode_empty_value() -> Self {
+            Self::new_extended(0, ExtendedTag::Empty)
+        }
+        #[inline]
+        pub fn encode_f64_value(x: f64) -> Self {
+            Self::from_raw(x.to_bits())
+        }
 
-    pub fn is_number(&self) -> bool {
-        self.is_double() || self.is_int32()
-    }
-
-    pub fn same_value_impl(lhs: Self, rhs: Self, _zero: bool) -> bool {
-        if lhs.is_number() {
-            if !rhs.is_number() {
-                return false;
+        #[inline]
+        pub const fn encode_nan_value() -> Self {
+            Self::from_raw(0x7ff8000000000000)
+        }
+        #[inline]
+        pub fn encode_untrusted_f64_value(val: f64) -> Self {
+            if val.is_nan() {
+                return Self::encode_nan_value();
             }
+            Self::encode_f64_value(val)
+        }
 
-            let lhsn = lhs.get_number();
-            let rhsn = rhs.get_number();
-            if lhsn == rhsn {
-                return true;
+        #[inline]
+        pub fn update_pointer(&self, val: *const ()) -> Self {
+            Self::internal_new(val as _, self.get_tag())
+        }
+
+        #[inline]
+        pub unsafe fn unsafe_update_pointer(&mut self, val: *const ()) {
+            self.0 = val as u64 | (self.get_tag() as u64) << Self::NUM_DATA_BITS as u64
+        }
+
+        #[inline]
+        pub fn is_null(&self) -> bool {
+            self.get_etag() == ExtendedTag::Null
+        }
+        #[inline]
+        pub fn is_undefined(&self) -> bool {
+            self.get_etag() == ExtendedTag::Undefined
+        }
+
+        #[inline]
+        pub fn is_empty(&self) -> bool {
+            self.get_etag() == ExtendedTag::Empty
+        }
+
+        #[inline]
+        pub fn is_native_value(&self) -> bool {
+            self.get_tag() == NATIVE_VALUE_TAG
+        }
+
+        #[inline]
+        pub fn is_int32(&self) -> bool {
+            self.get_tag() == INT32_TAG
+        }
+
+        #[inline]
+        pub fn is_bool(&self) -> bool {
+            self.get_tag() == BOOL_TAG
+        }
+
+        #[inline]
+        pub fn is_object(&self) -> bool {
+            self.get_tag() == OBJECT_TAG
+        }
+
+        #[inline]
+        pub fn is_double(&self) -> bool {
+            self.0 < ((FIRST_TAG as u64) << Self::NUM_DATA_BITS as u64)
+        }
+
+        #[inline]
+        pub fn is_pointer(&self) -> bool {
+            self.0 >= ((FIRST_PTR_TAG as u64) << Self::NUM_DATA_BITS as u64)
+        }
+
+        #[inline]
+        pub fn get_raw(&self) -> u64 {
+            self.0
+        }
+
+        #[inline]
+        pub fn get_pointer(&self) -> *mut () {
+            assert!(self.is_pointer());
+            unsafe { std::mem::transmute((self.0 & Self::DATA_MASK) as usize) }
+        }
+        #[inline]
+        pub fn get_int32(&self) -> i32 {
+            assert!(self.is_int32());
+            self.0 as u32 as i32
+        }
+        #[inline]
+        pub fn get_double(&self) -> f64 {
+            f64::from_bits(self.0)
+        }
+        #[inline]
+        pub fn get_native_value(&self) -> i64 {
+            assert!(self.is_native_value());
+            (((self.0 & Self::DATA_MASK as u64) as i64) << (64 - Self::NUM_DATA_BITS as i64))
+                >> (64 - Self::NUM_DATA_BITS as i64)
+        }
+
+        #[inline]
+        pub fn get_native_u32(&self) -> u32 {
+            assert!(self.is_native_value());
+            self.0 as u32
+        }
+
+        #[inline]
+        pub fn get_native_ptr(&self) -> *mut () {
+            assert!(self.is_native_value());
+            (self.0 & Self::DATA_MASK) as *mut ()
+        }
+
+        #[inline]
+        pub fn get_bool(&self) -> bool {
+            assert!(self.is_bool());
+            (self.0 & 0x1) != 0
+        }
+
+        #[inline]
+        pub fn get_object(&self) -> Managed<dyn Collectable> {
+            assert!(self.is_object());
+            unsafe { std::mem::transmute::<_, _>((self.0 & Self::DATA_MASK) as usize) }
+        }
+        #[inline]
+        pub fn get_object_raw(&self) -> *mut HeapObjectHeader {
+            assert!(self.is_object());
+            unsafe { std::mem::transmute::<_, _>((self.0 & Self::DATA_MASK) as usize) }
+        }
+
+        /// Get number value from JS value.If value is int32 value then it is casted to f64.
+        #[inline]
+        pub fn get_number(&self) -> f64 {
+            if self.is_int32() {
+                return self.get_int32() as f64;
             }
-            return lhsn.is_nan() && rhsn.is_nan();
+            self.get_double()
         }
 
-        if !lhs.is_object() || !rhs.is_object() {
-            return lhs.get_raw() == rhs.get_raw();
-        }
-        if lhs.is_object()
-            && rhs.is_object()
-            && lhs.get_object().is::<ScmString>()
-            && rhs.get_object().is::<ScmString>()
-        {
-            return unsafe {
-                lhs.get_object().downcast_unchecked::<ScmString>().string
-                    == rhs.get_object().downcast_unchecked::<ScmString>().string
-            };
+        pub unsafe fn set_no_barrier(&mut self, val: Self) {
+            self.0 = val.0;
         }
 
-        if lhs.is_object()
-            && rhs.is_object()
-            && lhs.get_object().is::<ScmSymbol>()
-            && rhs.get_object().is::<ScmSymbol>()
-        {
-            return unsafe {
-                lhs.get_object().downcast_unchecked::<ScmSymbol>().id
-                    == rhs.get_object().downcast_unchecked::<ScmSymbol>().id
-            };
+        pub fn is_number(&self) -> bool {
+            self.is_double() || self.is_int32()
         }
-        lhs.get_raw() == rhs.get_raw()
-    }
-    pub fn same_value(x: Value, y: Value) -> bool {
-        Self::same_value_impl(x, y, false)
-    }
-    pub fn same_value_zero(lhs: Self, rhs: Self) -> bool {
-        Self::same_value_impl(lhs, rhs, true)
     }
 }
+
+#[cfg(target_pointer_width = "64")]
+pub use new_value::*;
+#[cfg(target_pointer_width = "32")]
+pub use old_value::*;
 
 unsafe impl Trace for Value {
     fn trace(&mut self, vis: &mut dyn comet::api::Visitor) {
@@ -497,7 +714,7 @@ pub struct HashValueZero(pub Value);
 impl Hash for HashValueZero {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         if !self.0.is_object() {
-            let raw = (self.0).0;
+            let raw = (self.0).get_raw();
             raw.hash(state);
         } else if !self.0.is_empty() {
             let obj = self.0.get_object();
@@ -636,7 +853,7 @@ impl Collectable for Closure {}
 
 pub type NativeCallback = fn(&mut SchemeThread, args: &[Value]) -> Result<Value, Value>;
 pub type NativeTransformer =
-    fn(&mut FunctionLowerer, slow: &mut dyn FnMut(&mut FunctionLowerer) -> u32, u16) -> bool;
+    fn(&mut BC2LBC, slow: &mut dyn FnMut(&mut BC2LBC) -> LBCBlock, u16) -> bool;
 #[allow(dead_code)]
 pub struct NativeFunction {
     pub(crate) callback: NativeCallback,
@@ -747,6 +964,52 @@ unsafe impl Finalize for ScmCons {}
 impl Collectable for ScmCons {}
 
 impl Value {
+    pub fn same_value_impl(lhs: Self, rhs: Self, _zero: bool) -> bool {
+        if lhs.is_number() {
+            if !rhs.is_number() {
+                return false;
+            }
+
+            let lhsn = lhs.get_number();
+            let rhsn = rhs.get_number();
+            if lhsn == rhsn {
+                return true;
+            }
+            return lhsn.is_nan() && rhsn.is_nan();
+        }
+
+        if !lhs.is_object() || !rhs.is_object() {
+            return lhs.get_raw() == rhs.get_raw();
+        }
+        if lhs.is_object()
+            && rhs.is_object()
+            && lhs.get_object().is::<ScmString>()
+            && rhs.get_object().is::<ScmString>()
+        {
+            return unsafe {
+                lhs.get_object().downcast_unchecked::<ScmString>().string
+                    == rhs.get_object().downcast_unchecked::<ScmString>().string
+            };
+        }
+
+        if lhs.is_object()
+            && rhs.is_object()
+            && lhs.get_object().is::<ScmSymbol>()
+            && rhs.get_object().is::<ScmSymbol>()
+        {
+            return unsafe {
+                lhs.get_object().downcast_unchecked::<ScmSymbol>().id
+                    == rhs.get_object().downcast_unchecked::<ScmSymbol>().id
+            };
+        }
+        lhs.get_raw() == rhs.get_raw()
+    }
+    pub fn same_value(x: Value, y: Value) -> bool {
+        Self::same_value_impl(x, y, false)
+    }
+    pub fn same_value_zero(lhs: Self, rhs: Self) -> bool {
+        Self::same_value_impl(lhs, rhs, true)
+    }
     pub fn to_vec(self, thread: &mut SchemeThread) -> Result<Vec<Value>, Value> {
         let mut res = vec![];
         let mut el = self;

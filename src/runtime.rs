@@ -9,7 +9,7 @@ use self::{
 use crate::{
     compiler::make_env,
     init::enable_core,
-    method_jit::MethodJIT,
+    jit::c1::C1JIT,
     runtime::{value::Closure, vm::apply},
     Heap, Managed,
 };
@@ -137,8 +137,9 @@ pub(crate) struct RtInner {
     pub(crate) global_lock: Lock,
     pub(crate) dump_bytecode: bool,
     pub(crate) dump_jit: bool,
+    pub(crate) dump_disassembly: bool,
     pub(crate) hotness: usize,
-    pub(crate) jit: MethodJIT,
+    pub(crate) jit: C1JIT,
     pub(crate) jit_lock: Lock,
 }
 
@@ -195,6 +196,7 @@ impl Runtime {
         heap: MutatorRef<Heap>,
         dump_bytecode: bool,
         dump_jit: bool,
+        dump_disassembly: bool,
         hotness: usize,
     ) -> SchemeThreadRef {
         let rt = Runtime {
@@ -205,6 +207,7 @@ impl Runtime {
                 symbol_table: None,
                 globals: vec![],
                 dump_jit,
+                dump_disassembly,
 
                 qualified_imports: vec![],
                 module_search_paths: vec![],
@@ -215,7 +218,7 @@ impl Runtime {
 
                 global_lock: Lock::INIT,
                 hotness,
-                jit: MethodJIT::new(),
+                jit: C1JIT::new(),
                 jit_lock: Lock::INIT,
             })))
             .unwrap(),
@@ -991,8 +994,8 @@ impl std::fmt::Display for Value {
             )
         } else if self.is_object() {
             write!(f, "#<object at {:p}>", self.get_object())
-        } else if self.is_native_value() {
-            write!(f, "#<native value {}>", self.get_native_value())
+        /*} else if self.is_native_value() {
+        //write!(f, "#<native value {}>", self.get_native_value())*/
         } else if self.is_object() && self.get_object().is::<Macro>() {
             write!(f, "#<macro>")
         } else {

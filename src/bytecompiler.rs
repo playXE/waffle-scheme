@@ -4,7 +4,7 @@ use std::{
 };
 
 use comet::{
-    api::{Trace, Visitor},
+    api::{Collectable, Finalize, Trace, Visitor},
     letroot,
 };
 use comet_extra::alloc::vector::Vector;
@@ -1061,7 +1061,7 @@ impl ByteCompiler {
                         }
                         "if" => return self.compile_if(thread, rest, st),
                         "begin" => return self.compile_begin(thread, rest, st),
-                        "defmacro" => {
+                        "define-macro" => {
                             let rest = self.expect_cons(thread, rest)?;
                             let name = rest.car();
                             let name = if let lexpr::Value::Symbol(x) = name {
@@ -1077,6 +1077,14 @@ impl ByteCompiler {
                             if !st.is_unused() {
                                 self.null();
                             }
+                            return Ok(());
+                        }
+                        "define-syntax" => {
+                            self.compile_syntax(thread, exp)?;
+                            if !st.is_unused() {
+                                self.null();
+                            }
+
                             return Ok(());
                         }
                         "quote" | "'" => {
@@ -1121,6 +1129,12 @@ impl ByteCompiler {
                                 if value.is_cell::<Macro>() {
                                     let expanded = self.macro_expand_full(thread, value, rest)?;
                                     self.compile(thread, &expanded, st)?;
+                                    return Ok(());
+                                } else if value.is_cell::<Transform>() {
+                                    let expansion =
+                                        value.downcast::<Transform>().transform(thread, exp)?;
+                                    println!("=> {}", expansion);
+                                    self.compile(thread, &expansion, st)?;
                                     return Ok(());
                                 }
                             }
@@ -1433,7 +1447,43 @@ impl ByteCompiler {
             )),
         }
     }
+    pub fn compile_syntax(
+        &mut self,
+        thread: &mut SchemeThread,
+        expr: &lexpr::Value,
+    ) -> Result<(), Value> {
+        let transform = Transform::try_new(thread, expr)?;
+        let symbol = transform.keyword().clone();
+        let transform = thread
+            .mutator
+            .allocate(transform, comet::gc_base::AllocationSpace::New);
+        let mut env = self.env;
+        let parent = thread.runtime.global_symbol(crate::runtime::Global::Parent);
+        while !env_globalp(thread, env) {
+            env = env.get(Value::new(parent)).unwrap().table();
+        }
+        let name = make_symbol(thread, symbol.as_symbol().unwrap());
+        let mut qualified_name = env_qualify_name(thread, env, Value::new(name));
 
+        let exporting = self.exporting(thread);
+
+        env_define(
+            thread,
+            env,
+            Value::new(name),
+            Value::new(transform),
+            exporting,
+        );
+        env_define(
+            thread,
+            env,
+            Value::new(qualified_name),
+            Value::new(transform),
+            exporting,
+        );
+        qualified_name.value = Value::new(transform);
+        Ok(())
+    }
     pub fn compile_macro(
         &mut self,
         thread: &mut SchemeThread,
@@ -1543,3 +1593,564 @@ impl ByteCompiler {
         Ok(self.end(thread, 0, false))
     }
 }
+
+macro_rules! car {
+    ($thread: expr,$cell: expr) => {
+        if $cell.consp() {
+            $cell.car()
+        } else {
+            return Err();
+        }
+    };
+}
+fn syntax_error(thread: &mut SchemeThread, message: impl AsRef<str>) -> Value {
+    let tag = thread
+        .runtime
+        .global_symbol(crate::runtime::Global::ScmCompile);
+    let msg = make_string(thread, format!("syntax error: {}", message.as_ref()));
+    Value::new(make_exception(thread, tag, msg, Value::new(Null)))
+}
+
+pub fn expect_cons<'a>(
+    thread: &mut SchemeThread,
+    exp: &'a lexpr::Value,
+) -> Result<&'a lexpr::Cons, Value> {
+    exp.as_cons()
+        .ok_or_else(|| syntax_error(thread, format!("cons expected but `{}` found", exp)))
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    expr: lexpr::Value,
+    variables: Vec<lexpr::Value>,
+    expanded_variables: Vec<lexpr::Value>,
+    ellipsis: lexpr::Value,
+    literals: Vec<lexpr::Value>,
+    underscore: lexpr::Value,
+}
+
+impl Pattern {
+    pub fn new(
+        thread: &mut SchemeThread,
+        expr: &lexpr::Value,
+        ellipsis: &lexpr::Value,
+        literals: &[lexpr::Value],
+    ) -> Result<Self, Value> {
+        let mut pattern = Self {
+            expr: expr.clone(),
+            variables: vec![],
+            expanded_variables: vec![],
+            ellipsis: ellipsis.clone(),
+            literals: literals.to_vec(),
+            underscore: lexpr::Value::symbol("_"),
+        };
+        Self::build(thread, expr.as_cons().unwrap().cdr(), &mut pattern)?;
+        Ok(pattern)
+    }
+
+    pub fn is_ellipsis(&self, cell: &lexpr::Value) -> bool {
+        self.ellipsis == *cell
+    }
+
+    pub fn is_literal(&self, cell: &lexpr::Value) -> bool {
+        self.literals.iter().any(|it| it == cell)
+    }
+
+    pub fn is_variable(&self, cell: &lexpr::Value) -> bool {
+        self.variables.iter().any(|it| it == cell)
+    }
+
+    pub fn is_expanded_variable(&self, cell: &lexpr::Value) -> bool {
+        self.expanded_variables.iter().any(|it| it == cell)
+    }
+
+    fn is_variable_candidate(&self, cell: &lexpr::Value) -> bool {
+        cell.is_symbol()
+            && !self.is_literal(cell)
+            && !self.is_ellipsis(cell)
+            && *cell != self.underscore
+    }
+
+    fn build(
+        thread: &mut SchemeThread,
+        expr: &lexpr::Value,
+        pattern: &mut Self,
+    ) -> Result<(), Value> {
+        let improper = expr.is_dotted_list();
+        let len = expr.list_iter().map(|x| x.count()).unwrap_or_else(|| 0);
+
+        let mut iter = expr
+            .list_iter()
+            .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+            .enumerate()
+            .peekable();
+
+        let mut ellipsis_ct = 0;
+        while let Some((idx, it)) = iter.next() {
+            let ellipsis_next = match iter.peek() {
+                Some((_, cell)) => pattern.is_ellipsis(cell),
+                _ => false,
+            };
+
+            match it {
+                lexpr::Value::Symbol(_) => {
+                    if pattern.is_ellipsis(it) {
+                        if idx == 0 || (idx == len - 1 && improper) {
+                            return Err(syntax_error(
+                                thread,
+                                format!("invalid ellipsis placement in {}", expr),
+                            ));
+                        }
+
+                        ellipsis_ct += 1;
+
+                        if ellipsis_ct > 1 {
+                            return Err(syntax_error(
+                                thread,
+                                format!("duplicate ellipsis in {}", expr),
+                            ));
+                        }
+                        continue;
+                    }
+
+                    if pattern.is_variable_candidate(it) {
+                        if pattern.is_variable(it) {
+                            return Err(syntax_error(
+                                thread,
+                                format!("duplicate pattern variable `{}`", it),
+                            ));
+                        }
+
+                        pattern.variables.push(it.clone());
+                    } else if ellipsis_next {
+                        return Err(syntax_error(
+                            thread,
+                            format!("ellipsis must follow pattern variable (in {})", expr),
+                        ));
+                    }
+                    if ellipsis_next {
+                        Self::find_expanded_variables(it, pattern);
+                    }
+                }
+                lexpr::Value::Cons(_) => {
+                    if ellipsis_next {
+                        Self::find_expanded_variables(it, pattern);
+                    }
+                    Self::build(thread, it, pattern)?;
+                }
+                _ => (),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn find_expanded_variables(expr: &lexpr::Value, pattern: &mut Pattern) {
+        match expr {
+            lexpr::Value::Symbol(_) => {
+                if pattern.is_variable_candidate(expr)
+                    && !pattern.expanded_variables.iter().any(|it| it == expr)
+                {
+                    pattern.expanded_variables.push(expr.clone());
+                }
+            }
+            lexpr::Value::Cons(_) => {
+                for it in expr
+                    .list_iter()
+                    .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+                {
+                    Self::find_expanded_variables(it, pattern);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn car<'a>(thread: &mut SchemeThread, val: &'a Cell) -> Result<&'a Cell, Value> {
+    Ok(expect_cons(thread, val)?.car())
+}
+pub fn cdr<'a>(thread: &mut SchemeThread, val: &'a Cell) -> Result<&'a Cell, Value> {
+    Ok(expect_cons(thread, val)?.cdr())
+}
+
+type Cell = lexpr::Value;
+
+#[derive(Debug)]
+pub struct Transform {
+    keyword: lexpr::Value,
+    ellipsis: lexpr::Value,
+    syntax_rules: Vec<(Pattern, lexpr::Value)>,
+    literals: Vec<lexpr::Value>,
+}
+
+impl Transform {
+    pub fn try_new(thread: &mut SchemeThread, expr: &lexpr::Value) -> Result<Self, Value> {
+        let expr = expr.to_vec().unwrap_or_else(|| vec![]);
+        let (keyword, syntax_rules) = match expr.as_slice() {
+            [_, keyword, syntax_rules] => (keyword.clone(), syntax_rules.clone()),
+            _ => return Err(syntax_error(thread, "expected keyword and syntax-rules")),
+        };
+        if !keyword.is_symbol() {
+            return Err(syntax_error(thread, "keyword must be an identifier"));
+        }
+
+        let syntax_rules = expect_cons(thread, &syntax_rules)?.clone();
+
+        if *syntax_rules.car() != lexpr::Value::symbol("syntax-rules") {
+            return Err(syntax_error(thread, "expected syntax-rules"));
+        }
+        let syntax_rules = expect_cons(thread, syntax_rules.cdr())?;
+
+        let (syntax_rules, ellipsis) = match syntax_rules.car() {
+            lexpr::Value::Symbol(_) => {
+                let ellipsis = syntax_rules.car().clone();
+                let syntax_rules = syntax_rules.cdr().clone();
+                (syntax_rules, ellipsis)
+            }
+            _ => (
+                lexpr::Value::Cons(syntax_rules.clone()),
+                lexpr::Value::symbol("..."),
+            ),
+        };
+
+        let syntax_rules = expect_cons(thread, &syntax_rules)?;
+
+        let literals = syntax_rules.car().to_vec().unwrap_or_else(|| vec![]);
+
+        if literals.iter().any(|it| !it.is_symbol()) {
+            return Err(syntax_error(thread, "literals must be identifiers"));
+        }
+
+        let syntax_rules = syntax_rules.cdr();
+
+        let syntax_rules = syntax_rules.to_vec().unwrap_or_else(|| vec![]);
+
+        let mut syntax_rules_vec = vec![];
+
+        for it in syntax_rules {
+            let it = expect_cons(thread, &it)?;
+            let pattern = it.car();
+            let template = expect_cons(thread, it.cdr())?.car().clone();
+            let pattern = Pattern::new(thread, pattern, &ellipsis, &literals)?;
+            syntax_rules_vec.push((pattern, template));
+        }
+
+        let this = Transform {
+            keyword: keyword.clone(),
+            ellipsis,
+            syntax_rules: syntax_rules_vec,
+            literals,
+        };
+
+        Ok(this)
+    }
+    /// Transform
+    ///
+    /// Transform the input expression given the syntax-rules defined in
+    /// this transformer. An error is returned if none of the input expressions
+    /// match the patterns specified in the syntax-rules of this transformer.
+    ///
+    /// # Arguments
+    /// `expr` - The expression to transform
+    pub fn transform(&self, thread: &mut SchemeThread, expr: &Cell) -> Result<Cell, Value> {
+        let mut invalid_syntax = || Err(syntax_error(thread, format!("{}", self.keyword)));
+        if !expr.is_cons() {
+            invalid_syntax()?;
+        }
+
+        for rule in &self.syntax_rules {
+            let mut env = PatternEnvironment::new(&rule.0);
+            if self.pattern_match(cdr(thread, &rule.0.expr)?, cdr(thread, expr)?, &mut env) {
+                return self
+                    .expand(&rule.1, &rule.0, &mut env)
+                    .ok_or_else(|| syntax_error(thread, format!("{}", self.keyword)));
+            }
+        }
+
+        return Err(syntax_error(
+            thread,
+            format!("no matching syntax for {}", self.keyword),
+        ));
+    }
+
+    /// Pattern Match
+    ///
+    /// Attempt to match the input expression against one of the syntax-rules pattern,
+    /// returning a pattern environment if successful.
+    ///
+    /// # Arguments
+    /// `pattern` - The pattern to attempt to apply
+    /// `expr` - The expression to match
+    /// `bindings` - The set of matched variable bindings
+    fn pattern_match<'a, 'b>(
+        &self,
+        pattern: &'a Cell,
+        expr: &'a Cell,
+        env: &'b mut PatternEnvironment<'a>,
+    ) -> bool {
+        // expr and pattern must either both be lists or improper lists
+        if (pattern.is_cons() || pattern.is_null()) && !(expr.is_cons() || expr.is_null()) {
+            return false;
+        }
+        if expr.is_cons() && pattern.is_cons() && (expr.is_list() != pattern.is_list()) {
+            return false;
+        }
+
+        let expr_iter_c = expr
+            .list_iter()
+            .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+            .peekable()
+            .count();
+        let pattern_iter_c = pattern
+            .list_iter()
+            .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+            .peekable()
+            .count();
+
+        let mut expr_iter = expr
+            .list_iter()
+            .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+            .peekable();
+        let mut pattern_iter = pattern
+            .list_iter()
+            .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+            .peekable();
+
+        let mut expr;
+        let mut pattern = &Cell::Nil;
+
+        let mut in_ellipsis = false;
+
+        loop {
+            // Get the next expression
+            // If there is no next expression, then:
+            //   * If we are in an ellipsis expansion, move the pattern iterator
+            //     past it so we can see if more pattern remains.
+            //   * If any pattern remains, there is no match.
+            //   * If pattern was exhausted, then the match is complete.
+            expr = match expr_iter.next() {
+                Some(expr) => expr,
+                None => {
+                    if in_ellipsis {
+                        pattern_iter.next();
+                    }
+                    return match pattern_iter.next() {
+                        Some(_) => {
+                            if pattern_iter.peek() == Some(&&self.ellipsis) {
+                                pattern_iter.next();
+                                pattern_iter.peek().is_none()
+                            } else {
+                                false
+                            }
+                        }
+                        None => true,
+                    };
+                }
+            };
+
+            // Get the next pattern.
+            // * Reuse the same pattern if we're in an ellipsis expansion
+            //   and based on the expression length there's more to capture.
+            pattern = match in_ellipsis {
+                true => {
+                    if pattern_iter_c == expr_iter_c + 2 {
+                        pattern_iter.next();
+                        match pattern_iter.next() {
+                            Some(pattern) => pattern,
+                            None => return expr_iter.peek().is_none(),
+                        }
+                    } else {
+                        pattern
+                    }
+                }
+                false => match pattern_iter.next() {
+                    Some(pattern) => pattern,
+                    None => {
+                        return false;
+                    }
+                },
+            };
+
+            in_ellipsis = pattern_iter.peek() == Some(&&self.ellipsis);
+
+            match pattern {
+                Cell::Symbol(_) => {
+                    if self.is_literal(pattern) {
+                        if pattern != expr {
+                            return false;
+                        }
+                    } else if pattern != &lexpr::Value::symbol("_") {
+                        env.add_binding(pattern, expr);
+                    }
+                }
+                Cell::Cons(_) => {
+                    if !self.pattern_match(pattern, expr, env) {
+                        return false;
+                    }
+                }
+                pattern => {
+                    if pattern != expr {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Is Literal
+    ///
+    /// Is cell in the set of literals?
+    pub fn is_literal(&self, cell: &Cell) -> bool {
+        self.literals.iter().any(|it| it == cell)
+    }
+
+    pub fn keyword(&self) -> &Cell {
+        &self.keyword
+    }
+
+    /// Expand
+    ///
+    /// Given a list of bindings created from a pattern match, and a template, expand
+    /// the template with the bindings.
+    ///
+    /// # Arguments
+    /// `template` - The template to use for expansion
+    /// `pattern` - The pattern associated with the template being expanded.
+    /// `bindings` The matched bindings from the pattern
+    fn expand(
+        &self,
+        template: &Cell,
+        pattern: &Pattern,
+        env: &mut PatternEnvironment,
+    ) -> Option<Cell> {
+        match template {
+            Cell::Symbol(_) => {
+                return if pattern.is_variable(template) {
+                    env.get_binding(template).cloned()
+                } else {
+                    Some(template.clone())
+                }
+            }
+            Cell::Cons(_) => {
+                let mut v = vec![];
+                let mut template_iter = template
+                    .list_iter()
+                    .unwrap_or_else(|| lexpr::Value::Null.list_iter().unwrap())
+                    .peekable();
+                let mut template = template_iter.next().unwrap();
+
+                loop {
+                    let in_ellipsis = template_iter.peek() == Some(&&self.ellipsis);
+                    match self.expand(template, pattern, env) {
+                        Some(cell) => {
+                            v.push(cell);
+                            if in_ellipsis {
+                                continue;
+                            }
+                        }
+                        None => {
+                            if !in_ellipsis {
+                                return None;
+                            }
+                            template_iter.next();
+                        }
+                    }
+
+                    template = match template_iter.next() {
+                        Some(template) => template,
+                        None => {
+                            break;
+                        }
+                    };
+                }
+                Some(lexpr::Value::list(v))
+            }
+            cell => Some(cell.clone()),
+        }
+    }
+}
+
+/// Pattern Environment
+///
+/// Pattern environment is the result of a successful pattern,
+/// containing all of the information needed to apply the template
+/// portion of the pattern rule.
+#[derive(Debug, Clone)]
+struct PatternEnvironment<'a> {
+    /// Bindings are pairs of matched (pattern expr)
+    bindings: Vec<(&'a Cell, &'a Cell)>,
+
+    /// A copy of the pattern, which is used to determine what
+    /// type of bindings a variable is
+    pattern: &'a Pattern,
+
+    /// Position of expanded bindings (bindings that were captured
+    /// and expanded with the ellipsis)
+    iters: Vec<(&'a Cell, Option<usize>)>,
+}
+
+impl<'a> PatternEnvironment<'a> {
+    fn new(pattern: &'a Pattern) -> PatternEnvironment<'a> {
+        PatternEnvironment {
+            bindings: vec![],
+            pattern,
+            iters: pattern
+                .expanded_variables
+                .iter()
+                .map(|it| (it, None))
+                .collect(),
+        }
+    }
+
+    fn add_binding(&mut self, pattern: &'a Cell, expr: &'a Cell) {
+        self.bindings.push((pattern, expr));
+    }
+
+    fn get_binding(&mut self, symbol: &Cell) -> Option<&'a Cell> {
+        if !self.pattern.is_variable(symbol) {
+            None
+        } else if self.pattern.is_expanded_variable(symbol) {
+            self.get_expanded_binding(symbol)
+        } else {
+            self.bindings
+                .iter()
+                .find(|it| it.0 == symbol)
+                .map(|it| it.1)
+        }
+    }
+
+    fn get_expanded_binding(&mut self, symbol: &Cell) -> Option<&'a Cell> {
+        let iter = match self.iters.iter_mut().find(|it| it.0 == symbol) {
+            Some((_, iter)) => iter,
+            None => {
+                return None;
+            }
+        };
+
+        let start = match iter {
+            Some(position) => *position,
+            None => 0_usize,
+        };
+
+        match self.bindings[start..self.bindings.len()]
+            .iter()
+            .enumerate()
+            .find(|it| it.1 .0 == symbol)
+        {
+            Some(binding) => {
+                *iter = Some(start + binding.0 + 1);
+                Some(binding.1 .1)
+            }
+            None => {
+                *iter = None;
+                None
+            }
+        }
+    }
+}
+
+unsafe impl Trace for Transform {}
+unsafe impl Finalize for Transform {}
+
+impl Collectable for Transform {}

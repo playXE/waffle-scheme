@@ -20,12 +20,17 @@ use waffle::{
 pub struct Options {
     #[structopt(long, help = "Prints debug messages during compilation process")]
     debug_cc: bool,
-    #[structopt(long, help = "Prints Cranelift IR and assembly of JIT compiled code")]
+    #[structopt(
+        long,
+        help = "Displays LBC and Cranelift IR for JIT compiled functions"
+    )]
     dump_jit: bool,
+    #[structopt(long, help = "Displays diassembly for JIT compiled code")]
+    disassembly: bool,
     #[structopt(
         long,
         help = "Threshold after which we compile Scheme code using JIT",
-        default_value = "10"
+        default_value = "100"
     )]
     hotness: usize,
     #[structopt(
@@ -62,7 +67,13 @@ fn main() {
         .with_min_heap_size(opts.heap_min_size * 1024 * 1024)
         .with_initial_size(opts.heap_initial_size * 1024 * 1024);
     let immix = instantiate_immix::<NanBoxedDecoder>(immix_opts);
-    let mut thread = Runtime::new(immix, opts.debug_cc, opts.dump_jit, opts.hotness);
+    let mut thread = Runtime::new(
+        immix,
+        opts.debug_cc,
+        opts.dump_jit,
+        opts.disassembly,
+        opts.hotness,
+    );
     add_module_search_path(&mut thread, "./");
     for path in opts.module_search_paths.iter() {
         add_module_search_path(&mut thread, path);

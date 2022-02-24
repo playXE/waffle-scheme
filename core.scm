@@ -15,4 +15,6 @@
     let 
     let* 
     letrec
+    cond
+    while
 )

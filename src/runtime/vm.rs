@@ -5,7 +5,7 @@ use comet_extra::alloc::{array::Array, vector::Vector};
 
 use crate::{
     compiler::{Op, UpvalLoc},
-    method_jit::{JITSig, Trampoline},
+    jit::*,
     runtime::make_list,
     Managed,
 };
@@ -390,7 +390,10 @@ unsafe fn vm_loop(thread: &mut SchemeThread, trampoline: &mut Trampoline) -> Val
                 ) {
                     let inner = thread.runtime;
                     let inner = inner.inner();
-                    let code = inner.jit.compile(thread, proto, inner.dump_jit);
+                    let code =
+                        inner
+                            .jit
+                            .compile(thread, proto, inner.dump_jit, inner.dump_disassembly);
                     proto
                         .jit_code
                         .store(code as *mut u8, std::sync::atomic::Ordering::Release);
@@ -816,10 +819,10 @@ pub fn apply(thread: &mut SchemeThread, function: Value, args: &[Value]) -> Resu
                 {
                     let inner = thread.runtime;
                     let inner = inner.inner();
-                    let code = inner.jit.compile(thread, proto, inner.dump_jit);
-                    proto
-                        .jit_code
-                        .store(code as *mut u8, std::sync::atomic::Ordering::Release);
+                    let code =
+                        inner
+                            .jit
+                            .compile(thread, proto, inner.dump_jit, inner.dump_disassembly);
 
                     let fun = unsafe { std::mem::transmute::<_, JITSig>(code) };
 

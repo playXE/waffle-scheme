@@ -5,10 +5,10 @@ use std::{
 };
 
 use comet::{
-    api::{Collectable, Finalize, Trace, Visitor},
+    api::{Trace, Visitor},
     letroot,
 };
-use comet_extra::alloc::{hash::HashMap, vector::Vector};
+use comet_extra::alloc::vector::Vector;
 
 use crate::{
     runtime::{

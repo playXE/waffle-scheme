@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 use capstone::arch::BuildsCapstone;
@@ -12,7 +13,7 @@ use cranelift_module::{Linkage, Module};
 use target_lexicon::Triple;
 
 use crate::compiler::{Op, UpvalLoc};
-use crate::method_jit::Trampoline;
+use crate::jit::Trampoline;
 use crate::runtime::value::*;
 use crate::runtime::vm::*;
 use crate::runtime::*;
@@ -146,6 +147,7 @@ pub fn calling_convention() -> isa::CallConv {
     isa::CallConv::triple_default(&TRIPLE)
 }
 
+#[allow(dead_code)]
 pub struct C1JIT {
     builder: FunctionBuilderContext,
     ctx: codegen::Context,
@@ -154,6 +156,9 @@ pub struct C1JIT {
     trampoline: FuncId,
     apply: FuncId,
     close_over: FuncId,
+    cons: FuncId,
+    list: FuncId,
+    vector: FuncId,
 }
 
 impl C1JIT {
@@ -163,6 +168,9 @@ impl C1JIT {
         builder.symbol("jit_trampoline", jit_trampoline as *const u8);
         builder.symbol("jit_apply", jit_apply as *const u8);
         builder.symbol("close_over", close_over as *const u8);
+        builder.symbol("list", super::list as _);
+        builder.symbol("vector", super::vector as _);
+        builder.symbol("cons", super::cons as _);
         builder.hotswap(false);
         let mut module = JITModule::new(builder);
         let trampoline = {
@@ -198,9 +206,43 @@ impl C1JIT {
                 .declare_function("close_over", Linkage::Import, &close_over)
                 .unwrap()
         };
+        let cons = {
+            let mut cons = Signature::new(calling_convention());
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I64));
+            cons.returns.push(AbiParam::new(types::I64));
+            module
+                .declare_function("cons", Linkage::Import, &cons)
+                .unwrap()
+        };
 
+        let list = {
+            let mut cons = Signature::new(calling_convention());
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I32));
+            cons.returns.push(AbiParam::new(types::I64));
+            module
+                .declare_function("list", Linkage::Import, &cons)
+                .unwrap()
+        };
+
+        let vector = {
+            let mut cons = Signature::new(calling_convention());
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I64));
+            cons.params.push(AbiParam::new(types::I32));
+            cons.returns.push(AbiParam::new(types::I64));
+            module
+                .declare_function("vector", Linkage::Import, &cons)
+                .unwrap()
+        };
         Self {
             trampoline,
+            cons,
+            list,
+            vector,
             apply,
             close_over,
             ctx: module.make_context(),
@@ -209,14 +251,24 @@ impl C1JIT {
             isa: get_isa(),
         }
     }
-
-    pub fn compile(&mut self, thread: &mut SchemeThread, proto: Managed<ScmPrototype>, dump: bool) {
+    #[allow(unused_variables)]
+    pub fn compile(
+        &mut self,
+        thread: &mut SchemeThread,
+        proto: Managed<ScmPrototype>,
+        dump_jit: bool,
+        dump_disassembly: bool,
+    ) -> *mut u8 {
         let code = proto.code.as_ptr();
         let len = proto.code.len() / size_of::<Op>();
         let code = unsafe { std::slice::from_raw_parts::<Op>(code.cast::<Op>(), len) };
 
         let lbc = BC2LBC::new(proto, code).generate();
-        println!("{}", lbc.display());
+
+        if dump_jit {
+            println!("low-level bytecode for {}: ", Value::new(proto));
+            println!("{}", lbc.display());
+        }
         {
             for _ in 0..3 {
                 self.ctx
@@ -241,6 +293,17 @@ impl C1JIT {
             let close_over = self
                 .module
                 .declare_func_in_func(self.close_over, &mut builder.func);
+
+            let cons = self
+                .module
+                .declare_func_in_func(self.cons, &mut builder.func);
+            let list = self
+                .module
+                .declare_func_in_func(self.list, &mut builder.func);
+            let vector = self
+                .module
+                .declare_func_in_func(self.vector, &mut builder.func);
+
             let entry_block = builder.create_block();
             builder.append_block_params_for_function_params(entry_block);
             builder.switch_to_block(entry_block);
@@ -255,6 +318,8 @@ impl C1JIT {
             let mut compiler = C1Translator {
                 module: &self.module,
                 builder,
+                slowpaths: vec![],
+                stack_slots: HashMap::new(),
                 func: &lbc,
                 proto,
                 jit_apply: apply,
@@ -273,15 +338,53 @@ impl C1JIT {
                 current: ir::Block::from_u32(0),
                 blocks: Default::default(),
                 ungenerated: Default::default(),
+                vector,
+                cons,
+                list,
             };
 
             compiler.generate(entry);
 
             compiler.builder.seal_all_blocks();
-            println!("{}", compiler.builder.func.display());
+
             compiler.builder.finalize();
 
             cranelift_preopt::optimize(&mut self.ctx, &*get_isa()).unwrap();
+
+            if dump_jit {
+                println!("Cranelift IR for {}:", Value::new(proto));
+                println!("{}", self.ctx.func.display());
+            }
+            let info = self.ctx.compile(&*get_isa()).unwrap();
+            let mut code_ = vec![0; info.total_size as usize];
+            unsafe {
+                self.ctx.emit_to_memory(&mut code_[0]);
+            }
+
+            let name = get_jit_name(proto);
+            let id = self
+                .module
+                .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
+                .unwrap();
+            self.module.define_function(id, &mut self.ctx).unwrap();
+            self.module.clear_context(&mut self.ctx);
+            self.module.finalize_definitions();
+            let code = self.module.get_finalized_function(id);
+            if dump_disassembly {
+                println!("disassembly for {}", Value::new(proto));
+
+                let cs = disasm();
+
+                let insns = cs.disasm_all(&code_, code as _);
+                for ins in insns.unwrap().iter() {
+                    println!("{}", ins);
+                }
+            }
+
+            proto
+                .jit_code
+                .store(code as _, std::sync::atomic::Ordering::Release);
+            code as *mut u8
         }
     }
 }

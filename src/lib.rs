@@ -1,5 +1,5 @@
 #![feature(arbitrary_self_types, vec_retain_mut, core_intrinsics)]
-use comet::api::{Collectable, Gc, HeapObjectHeader};
+use comet::api::{Collectable, Gc};
 use runtime::NanBoxedDecoder;
 
 #[cfg(feature = "immix")]
@@ -31,11 +31,9 @@ macro_rules! debug_unreachable {
     }};
 }
 
+pub mod bytecompiler;
 pub mod compiler;
 pub mod init;
-//pub mod jit;
-pub mod bytecompiler;
 pub mod jit;
-pub mod method_jit;
 pub mod runtime;
 pub mod tracing_jit;

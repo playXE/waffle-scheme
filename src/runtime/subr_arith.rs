@@ -1,6 +1,7 @@
-use super::{defun, defun_with_transformer, value::Value, SchemeThread};
-use crate::{init::wrong_type_argument, method_jit::lir::*, method_jit::lower::FunctionLowerer};
+use super::{defun, value::Value, SchemeThread};
+use crate::init::wrong_type_argument;
 use num::traits::Inv;
+/*
 pub fn subr_num_add_inline(
     gen: &mut FunctionLowerer,
     slowpath: &mut dyn FnMut(&mut FunctionLowerer) -> u32,
@@ -45,7 +46,7 @@ pub fn subr_num_lt_inline(
     gen.gen.emit(Lir::IBin(Bin::Lt));
 
     true
-}
+}*/
 pub fn subr_num_add(thread: &mut SchemeThread, args: &[Value]) -> Result<Value, Value> {
     if args.len() == 2 {
         if args[0].fixnump() && args[1].fixnump() {
@@ -498,20 +499,12 @@ pub fn subr_num_nan_pred(thread: &mut SchemeThread, args: &[Value]) -> Result<Va
 }
 
 pub(crate) fn init(thread: &mut SchemeThread) {
-    defun_with_transformer(
-        thread,
-        "+",
-        subr_num_add,
-        0,
-        true,
-        false,
-        subr_num_add_inline,
-    );
+    defun(thread, "+", subr_num_add, 0, true, false);
     defun(thread, "-", subr_num_sub, 0, true, false);
     defun(thread, "/", subr_num_div, 1, true, false);
     defun(thread, "*", subr_num_mul, 0, true, false);
     defun(thread, "=", subr_num_eq, 1, true, false);
-    defun_with_transformer(thread, "<", subr_num_lt, 1, true, false, subr_num_lt_inline);
+    defun(thread, "<", subr_num_lt, 1, true, false);
     defun(thread, ">", subr_num_gt, 1, true, false);
     defun(thread, ">=", subr_num_ge, 1, true, false);
     defun(thread, "<=", subr_num_le, 1, true, false);

@@ -23,6 +23,10 @@ pub enum LBC {
     Return,
     ReturnUndef,
 
+    /// Hint to compiler that top value on the stack is of specific type
+    Hint(Type),
+    HintAt(i16, Type),
+
     Dup,
     Swap,
 
@@ -31,7 +35,7 @@ pub enum LBC {
     Trampoline(u16),
     TrampolineStatic(u32, u16),
     SelfTailCall,
-
+    Is(Type),
     JumpIfFalse(LBCBlock),
     JumpIfTrue(LBCBlock),
     JumpIfType(Type, LBCBlock),
@@ -44,6 +48,10 @@ pub enum LBC {
     Jump(LBCBlock),
     OSR(LBCBlock),
     Pop,
+
+    Cons,
+    List(u16),
+    Vector(u16),
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Access {
@@ -107,7 +115,8 @@ pub enum Type {
     Bool,
     Null,
     Undefined,
-
+    Cons,
+    Vector,
     Heap(u32),
 }
 
@@ -135,6 +144,7 @@ impl std::fmt::Display for LBCBlock {
 pub struct BasicBlock {
     /// true if this basic block is entrypoint i.e start of loop or first block in the function
     pub entrypoint: Option<u32>,
+    pub slowpath: bool,
     pub code: Vec<LBC>,
     pub id: LBCBlock,
 }
@@ -163,6 +173,7 @@ impl LBCFunction {
             entrypoint: None,
             code: vec![],
             id: LBCBlock(id as _),
+            slowpath: false,
         });
         LBCBlock(id as _)
     }
@@ -207,6 +218,12 @@ impl<'a> std::fmt::Display for LBCDisplay<'a> {
             for op in block.code.iter() {
                 write!(f, "    ")?;
                 match op {
+                    LBC::Is(t) => writeln!(f, "is {:?}", t)?,
+                    LBC::Cons => writeln!(f, "cons")?,
+                    LBC::Vector(n) => writeln!(f, "vector {}", n)?,
+                    LBC::List(n) => writeln!(f, "list {}", n)?,
+                    LBC::Hint(ty) => writeln!(f, "hint {:?}", ty)?,
+                    LBC::HintAt(at, x) => writeln!(f, "hint {},{:?}", at, x)?,
                     LBC::Pop => writeln!(f, "pop")?,
                     LBC::Imm32(x) => writeln!(f, "int32 {}", x)?,
                     LBC::ImmNull => writeln!(f, "null")?,

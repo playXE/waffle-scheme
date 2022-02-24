@@ -3,6 +3,7 @@ use comet::api::{Collectable, Finalize, Trace};
 use crate::runtime::{
     cons, define, defun, defun_with_transformer, make_box, make_exception, make_list, make_string,
     make_vector,
+    subr_inline::{car_inline, cdr_inline, cons_inline, list_inline, nullp_inline},
     value::{Null, ScmBox, ScmSymbol, ScmVector, Value},
     SchemeThread,
 };
@@ -59,6 +60,7 @@ fn init_core(thread: &mut SchemeThread) {
         "car",
         |thread, args| {
             if !args[0].consp() {
+                println!("{:#?}",thread.backtrace());
                 return Err(wrong_type_argument(thread, "car", "pair", args[0], 1));
             }
             Ok(args[0].car())
@@ -66,9 +68,9 @@ fn init_core(thread: &mut SchemeThread) {
         1,
         false,
         false,
-        crate::runtime::subr_inline::car_inline,
+        car_inline,
     );
-    defun(
+    defun_with_transformer(
         thread,
         "cdr",
         |thread, args| {
@@ -80,15 +82,17 @@ fn init_core(thread: &mut SchemeThread) {
         1,
         false,
         false,
+        cdr_inline,
     );
 
-    defun(
+    defun_with_transformer(
         thread,
         "list",
         |thread, args| Ok(make_list(thread, args)),
         0,
         true,
         false,
+        list_inline,
     );
 
     defun(
@@ -192,13 +196,14 @@ fn init_core(thread: &mut SchemeThread) {
         false,
     );
 
-    defun(
+    defun_with_transformer(
         thread,
         "null?",
         |_, args| Ok(Value::new(args[0].is_null())),
         1,
         false,
         false,
+        nullp_inline,
     );
 
     defun(
@@ -236,13 +241,14 @@ fn init_core(thread: &mut SchemeThread) {
         false,
     );
 
-    defun(
+    defun_with_transformer(
         thread,
         "cons",
         |thread, args| Ok(Value::new(cons(thread, args[0], args[1]))),
         2,
         false,
         false,
+        cons_inline,
     );
 
     defun(

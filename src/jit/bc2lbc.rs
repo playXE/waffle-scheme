@@ -1,10 +1,14 @@
 use super::lbc::{Access, LBCBlock, LBCFunction, LBC};
-use crate::{compiler::Op, runtime::value::ScmPrototype, Managed};
+use crate::{
+    compiler::Op,
+    runtime::value::{NativeFunction, ScmPrototype, ScmSymbol},
+    Managed,
+};
 use std::collections::{BTreeMap, VecDeque};
 
 #[allow(dead_code)]
 pub struct BC2LBC<'a> {
-    func: LBCFunction,
+    pub func: LBCFunction,
     code: &'a [Op],
 
     to_be_generated: VecDeque<ToBeGenerated>,
@@ -104,6 +108,84 @@ impl<'a> BC2LBC<'a> {
                     self.end_of_basic_block = true;
                     index += 2;
                 }
+                [Op::PushConstant(x), Op::GlobalGet, Op::Apply(nargs), ..] => {
+                    let sym = self.proto.constants[*x as usize].downcast::<ScmSymbol>();
+                    // try to inline native function
+                    if !sym.mutable && sym.value.native_functionp() {
+                        let func = sym.value.downcast::<NativeFunction>();
+                        if let Some(transformer) = func.transformer {
+                            let mut slowpath = None;
+                            let mut cb = |gen: &mut BC2LBC| {
+                                if let Some(target) = slowpath {
+                                    return target;
+                                }
+                                slowpath = Some(gen.func.new_block());
+
+                                let bb = slowpath.unwrap();
+                                gen.func.blocks[bb.0 as usize].slowpath = true;
+                                bb
+                            };
+
+                            if transformer(self, &mut cb, *nargs) {
+                                if let Some(block) = slowpath {
+                                    let merge_block = self.func.new_block();
+                                    self.func.emit(LBC::Jump(merge_block));
+                                    self.func.switch_to_block(block);
+                                    self.func.emit(LBC::Get(Access::Global(*x)));
+                                    self.func.emit(LBC::Call(*nargs));
+                                    self.func.emit(LBC::Jump(merge_block));
+                                    self.func.switch_to_block(merge_block);
+                                }
+                                index += 3;
+                                continue;
+                            }
+                        }
+                    }
+                    self.func.emit(LBC::Get(Access::Global(*x)));
+                    self.func.emit(LBC::Call(*nargs));
+                    index += 3;
+                }
+                [Op::PushConstant(x), Op::GlobalGet, Op::TailApply(nargs), ..] => {
+                    let sym = self.proto.constants[*x as usize].downcast::<ScmSymbol>();
+                    // try to inline native function
+                    'gen: loop {
+                        if !sym.mutable && sym.value.native_functionp() {
+                            let func = sym.value.downcast::<NativeFunction>();
+                            if let Some(transformer) = func.transformer {
+                                let mut slowpath = None;
+                                let mut cb = |gen: &mut BC2LBC| {
+                                    if let Some(target) = slowpath {
+                                        return target;
+                                    }
+                                    slowpath = Some(gen.func.new_block());
+
+                                    let bb = slowpath.unwrap();
+                                    gen.func.blocks[bb.0 as usize].slowpath = true;
+                                    bb
+                                };
+
+                                if transformer(self, &mut cb, *nargs) {
+                                    self.func.emit(LBC::Return);
+                                    if let Some(block) = slowpath {
+                                        self.func.switch_to_block(block);
+                                        self.func.emit(LBC::Get(Access::Global(*x)));
+                                        self.func.emit(LBC::Trampoline(*nargs));
+                                        self.func.emit(LBC::ReturnUndef);
+                                    }
+                                    index += 3;
+                                    self.end_of_basic_block = true;
+                                    break 'gen;
+                                }
+                            }
+                        }
+                        self.func.emit(LBC::Get(Access::Global(*x)));
+                        self.func.emit(LBC::Trampoline(*nargs));
+                        self.func.emit(LBC::ReturnUndef);
+                        self.end_of_basic_block = true;
+                        index += 3;
+                        break 'gen;
+                    }
+                }
                 [Op::PushFalse, Op::JumpIfFalse(x), ..]
                 | [Op::PushNull, Op::JumpIfFalse(x), ..] => {
                     let target_block = self.get_or_create_block(*x);
@@ -178,6 +260,10 @@ impl<'a> BC2LBC<'a> {
                 }
                 [Op::Pop, ..] => {
                     self.func.emit(LBC::Pop);
+                    index += 1;
+                }
+                [Op::PushConstant(x), ..] => {
+                    self.func.emit(LBC::Constant(*x));
                     index += 1;
                 }
 
