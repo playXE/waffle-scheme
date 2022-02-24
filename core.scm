@@ -1,6 +1,7 @@
 (module core)
 (import core primitives)
 (import core macros)
+(import core lists)
 (export 
     map 
     append 
@@ -17,4 +18,6 @@
     letrec
     cond
     while
+
+    assq
 )
