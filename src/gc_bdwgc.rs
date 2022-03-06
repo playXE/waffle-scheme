@@ -11,6 +11,8 @@ use crate::{
 
 use self::ffi::ProfileStats;
 
+pub const DEFAULT_INITIAL_HEAP_SIZE: usize = 256 * 1024 * size_of::<usize>();
+
 pub struct Heap {}
 impl Heap {
     #[allow(unused_variables)]
@@ -25,7 +27,14 @@ impl Heap {
         verbose: u8,
     ) -> Self {
         unsafe {
+            ffi::GC_set_all_interior_pointers(1);
+            std::env::set_var("GC_MARKERS", "1");
             ffi::GC_init();
+            let sz = ffi::GC_get_heap_size();
+
+            if sz < DEFAULT_INITIAL_HEAP_SIZE {
+                ffi::GC_expand_hp(DEFAULT_INITIAL_HEAP_SIZE - sz);
+            }
         }
         Self {}
     }
@@ -110,6 +119,7 @@ impl Heap {
         (*header).set_syntatic(syntatic);
 
         (*header).tag = tag as u32;
+
         #[cfg(feature = "track-source")]
         {
             (*header).source = std::panic::Location::caller();
@@ -184,6 +194,11 @@ mod ffi {
 
     #[link(name = "gc")]
     extern "C" {
+
+        pub(crate) fn GC_get_heap_size() -> usize;
+        pub(crate) fn GC_expand_hp(x: usize);
+
+        pub(crate) fn GC_set_all_interior_pointers(x: i32);
         pub(crate) fn GC_malloc(nbytes: usize) -> *mut u8;
 
         pub(crate) fn GC_malloc_uncollectable(nbytes: usize) -> *mut u8;

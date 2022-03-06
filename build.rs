@@ -39,13 +39,9 @@ fn main() {
 
     run("./autogen.sh", |cmd| cmd);
     run("./configure", |cmd| {
-        cmd.arg("--enable-static").arg("--disable-shared").env(
-            "CFLAGS",
-            format!(
-                "{} {} {} -O2",
-                "-DTHREAD_LOCAL_ALLOCATOR", "-fPIC", "-DALL_INTERIOR_POINTERS"
-            ),
-        )
+        cmd.arg("--enable-static")
+            .arg("--disable-shared")
+            .env("CFLAGS", format!("{} -O2", "-fPIC",))
     });
 
     run("make", |cmd| cmd.arg("-j"));

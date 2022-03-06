@@ -514,6 +514,7 @@ impl Heap {
     }
 
     pub unsafe fn free(&mut self, pointer: *mut u8) {
+        return;
         let cell = pointer.sub(size_of::<CellHeader>());
         let sz = (*cell.cast::<CellHeader>()).size();
         self.allocator.free(cell);

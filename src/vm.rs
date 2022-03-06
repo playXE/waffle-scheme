@@ -1785,7 +1785,7 @@ impl Compiler {
             false,
         );
         unsafe {
-            ctx.heap().add_drop(cc);
+            //   ctx.heap().add_drop(cc);
         }
         cc
     }

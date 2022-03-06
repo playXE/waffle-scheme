@@ -9,6 +9,7 @@ use std::{
 
 use crate::{
     gc::{allocator::PageReleaseMode, Gc},
+    gc_bdwgc::DEFAULT_INITIAL_HEAP_SIZE,
     vec::GcVec,
     vm::{env_define, Compiler},
 };
@@ -895,9 +896,9 @@ impl Default for ContextParams {
         Self {
             gc_verbose: 0,
             heap_growth_multiplier: 1.5,
-            heap_max_size: 8 * 1024 * 1024,
+            heap_max_size: 128 * 1024 * 1024,
             heap_min_size: 32 * 1024,
-            heap_size: 8 * 1024 * 1024,
+            heap_size: DEFAULT_INITIAL_HEAP_SIZE,
             heap_threshold: 128 * 1024,
             page_release_mode: PageReleaseMode::SizeAndEnd,
             page_release_threshold: 16 * 1024,
@@ -938,6 +939,7 @@ impl Context {
             p.page_release_threshold,
             p.gc_verbose,
         ));
+
         let stack = Stack::new(&mut heap, p.stack_size);
         let targs = GcVec::with_capacity(&mut heap, 6);
 

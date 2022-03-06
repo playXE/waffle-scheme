@@ -191,7 +191,7 @@ impl HashTable {
         mut pos: usize,
         hash: u32,
     ) {
-        if self.size >= (self.count as f64 * 0.75) as u32 {
+        if self.count >= (self.size as f64 * 0.75) as u32 {
             self.resize(ctx);
             pos = (hash % self.size) as usize;
         }

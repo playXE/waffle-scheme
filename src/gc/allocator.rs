@@ -1048,7 +1048,7 @@ impl<const USE_TAIL: bool> SlotFreeList<USE_TAIL> {
         }
         debug_assert!(!slot.is_null());
         unsafe {
-            debug_assert!((*slot).next().is_null());
+            debug_assert!((*slot).next().is_null(), "{:p}", (*slot).next);
             let headp = &self.head as *const u64 as *mut *mut Slot;
             let tailp = if USE_TAIL {
                 &self.tail as *const u64 as *mut *mut Slot

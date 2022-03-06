@@ -1,16 +1,4 @@
-use waffle::{
-    sexp::{intern, Context, ContextParams, ContextRef, HashTable, Value},
-    vm::{apply, Compiler},
-};
-
-const SRC: &'static str = r#"
-(define foo 1)
-(define bar 2)
-
-"#;
-
-#[inline(never)]
-fn foo(ctx: ContextRef) {}
+use waffle::sexp::{Context, ContextParams, Value};
 
 fn main() {
     let mut p = ContextParams::default();
@@ -20,4 +8,5 @@ fn main() {
     ctx.module_search_paths.push("./".to_string());
     let res = ctx.load_file("file.scm", Value::new_null());
     println!("{}", res);
+    ctx.heap().print_stats();
 }
