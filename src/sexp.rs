@@ -552,6 +552,7 @@ impl Value {
         if !u.converted {
             let tmp = unsafe { u.inner.local_ref.read() };
             u.inner.converted = tmp;
+            u.converted = true;
         }
     }
 
@@ -589,7 +590,7 @@ impl Value {
     pub fn bvector_ref<T: Copy>(self, x: usize) -> T {
         unsafe {
             let v = self.downcast::<Bytes>(ValueType::Bytes as _);
-            debug_assert!(v.length > x);
+            debug_assert!(v.length > x * size_of::<T>());
             v.data.as_ptr().cast::<T>().add(x).read()
         }
     }
@@ -597,7 +598,12 @@ impl Value {
     pub fn bvector_set<T: Copy>(self, x: usize, val: T) {
         unsafe {
             let mut v = self.downcast::<Bytes>(ValueType::Bytes as _);
-            debug_assert!(v.length > x + size_of::<T>());
+            debug_assert!(
+                v.length > x * size_of::<T>(),
+                "{} > {}",
+                v.length,
+                x * size_of::<T>()
+            );
             v.data.as_mut_ptr().cast::<T>().add(x).write(val);
         }
     }
@@ -858,7 +864,7 @@ pub const GLOBAL_SYMBOLS: &'static [&'static str] = &[
     "table",
     "type",
     "define",
-    "set",
+    "set!",
     "lambda",
     "if",
     "%define-syntax",
@@ -1361,7 +1367,7 @@ impl Stack {
         if callee.procedurep() {
             let proc = callee.downcast::<Procedure>(ValueType::Function as _);
             (*mem).locals = (*mem).bp.add(proc.stack_max as _);
-            (*mem).upvalues = (*mem).upvalues.add(proc.locals as _);
+            (*mem).upvalues = (*mem).locals.add(proc.locals as _);
             (*mem).ip = proc.code.bvector_raw();
         } else {
             (*mem).ip = callee
@@ -1476,7 +1482,7 @@ fn format(visited: &mut HashSet<Value>, val: Value, f: &mut fmt::Formatter<'_>) 
         }
         if !x.is_null() {
             write!(f, " . ")?;
-            format(visited, x.cdr(), f)?;
+            format(visited, x, f)?;
         }
         write!(f, ")")?;
     } else if val.vectorp() {

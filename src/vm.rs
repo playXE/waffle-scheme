@@ -5,8 +5,9 @@ use crate::{
     gc::Gc,
     sexp::{
         intern, make_bytes, make_bytes2, make_env, make_exception, make_pair, make_string,
-        make_synclo, make_vector, CallResult, Closure, Context, ContextRef, Global, NativeCallback,
-        NativeProcedure, Op, Procedure, Symbol, Upvalue, UpvaluerInner, Value, ValueType,
+        make_synclo, make_vector, r5rs_equal_pred, CallResult, Closure, Context, ContextRef,
+        Global, NativeCallback, NativeProcedure, Op, Procedure, Symbol, Upvalue, UpvaluerInner,
+        Value, ValueType,
     },
     vec::GcVec,
 };
@@ -103,7 +104,7 @@ unsafe fn vm_apply(mut ctx: ContextRef) -> Value {
             let (proc, clos) = if function.procedurep() {
                 (function, Value::new_null())
             } else {
-                (function, function.closure_procedure())
+                (function.closure_procedure(), function)
             };
 
             procedure = proc;
@@ -145,6 +146,7 @@ unsafe fn vm_apply(mut ctx: ContextRef) -> Value {
             panic!("{}", function);
             return not_a_function(ctx, function);
         }
+
         let procedure = procedure.downcast::<Procedure>(ValueType::Function as _);
         let res = check_arguments(
             ctx,
@@ -335,7 +337,7 @@ unsafe fn vm_apply(mut ctx: ContextRef) -> Value {
                     ip = ip.add(2);
                     let func = pop!();
                     let args = slice!(nargs);
-
+                    //println!("{:p} apply {}", ip.sub(3), func,);
                     let res = apply(ctx, func, args);
                     for _ in 0..nargs {
                         pop!();
@@ -726,13 +728,17 @@ impl Gc<Compiler> {
             let module = delegates.car();
             let exports = module.hash_get(self.ctx, exports, Value::new_null());
             let sym = exports.hash_get(self.ctx, name, Value::new_null());
+
             if !sym.is_null() {
                 return sym;
             }
             delegates = delegates.cdr();
         }
 
-        env_qualify_name(self.ctx, self.env, name)
+        let sym = env_qualify_name(self.ctx, self.env, name);
+
+        sym.set_symbol_module(self.env);
+        sym
     }
     pub fn compile_error(&mut self, s: impl AsRef<str>) -> Value {
         let kind = self.ctx.global(Global::ScmCompile);
@@ -811,6 +817,7 @@ impl Gc<Compiler> {
         }
 
         self.compile(exp.car(), State::USED_NON_FINAL)?;
+
         self.emit(&[if state.is_final() {
             Op::TailApply as u8
         } else {
@@ -895,7 +902,7 @@ impl Gc<Compiler> {
         self.env_define(self.env, symbol, val, false);
         let lambda = if env_globalp(self.ctx, self.env) {
             lambda
-        } else {
+        } else if !lambda.is_null() {
             let ix = self.add_constant(lambda).to_ne_bytes();
             self.emit(&[Op::LoadC as _]);
             let mut c = self.ctx;
@@ -905,7 +912,10 @@ impl Gc<Compiler> {
             }
             self.push(1);
             Value::new_null()
-        };
+        } else {
+            // self.compile(value.car(), State::USED_NON_FINAL)
+            Value::new_null()
+        }?;
         self.generate_set(&l, exp, symbol, lambda);
         Value::new_null()
     }
@@ -921,6 +931,7 @@ impl Gc<Compiler> {
         let mut argc = 0;
         if args.symbolp() {
             self.env_define(new_env, args, Value::new_i32(argc), false);
+
             argc += 1;
             variable_arity = true;
         } else if args.pairp() {
@@ -980,10 +991,15 @@ impl Gc<Compiler> {
                         self.emit(&[Op::LoadC as _]);
                         let mut ct = self.ctx;
                         self.code.extend_from_slice(ct.heap(), &c);
+                        self.push(1);
                         return Value::new_null();
                     }
                     "set!" => {
                         self.compile_set(rest)?;
+                        if !state.is_unused() {
+                            self.emit(&[Op::LoadN as _]);
+                            self.push(1);
+                        }
                         return Value::new_null();
                     }
                     "begin" => return self.compile_begin(rest, state),
@@ -996,6 +1012,7 @@ impl Gc<Compiler> {
                             let f =
                                 self.generate_lambda(Value::new_null(), args, body, &mut closure)?;
                             let x = self.add_constant(f);
+
                             self.emit(&[Op::LoadC as _]);
                             let mut c = self.ctx;
                             self.code.extend_from_slice(c.heap(), &x.to_ne_bytes());
@@ -1109,8 +1126,8 @@ impl Gc<Compiler> {
 
         let body = exp.cdr();
 
-        let args = make_pair(self.ctx, env_name, Value::new_null());
-        let args = make_pair(self.ctx, macro_env_name, args);
+        let args = make_pair(self.ctx, macro_env_name, Value::new_null());
+        let args = make_pair(self.ctx, env_name, args);
         let args = make_pair(self.ctx, expr_name, args);
 
         let mut clos = false;
@@ -1200,13 +1217,12 @@ impl Gc<Compiler> {
 
         let second = self.env;
         let result = apply(self.ctx, function, &[first, second])?;
-
+        println!("=> {}", result);
         let mut other_env = function
             .downcast::<NativeProcedure>(ValueType::NativeFunction as _)
             .closure
             .vector_ref(0);
         std::mem::swap(&mut self.env, &mut other_env);
-
         let result = self.compile(result, state);
         std::mem::swap(&mut self.env, &mut other_env);
 
@@ -1238,7 +1254,11 @@ impl Gc<Compiler> {
             size_of::<usize>() * self.local_free_variable_count,
             0,
         );
-        let upvals = make_bytes2(self.ctx, self.upvalue_count * size_of::<UpvalLoc>(), 0);
+        let upvals = make_bytes2(
+            self.ctx,
+            self.free_upvariables.len() * size_of::<UpvalLoc>(),
+            0,
+        );
 
         let mut freevar_i = 0;
         let mut upvar_i = 0;
@@ -1283,7 +1303,7 @@ impl Gc<Compiler> {
             false,
             false,
         );
-        println!("{}", disasm(self.ctx, Value::new_cell(p)));
+        //   println!("{}", disasm(self.ctx, Value::new_cell(p)));
         Value::new_cell(p)
     }
 
@@ -1322,13 +1342,30 @@ impl Gc<Compiler> {
                     *lookup = Lookup::Global {
                         value: cell,
                         module: if search_exports {
-                            env.hash_get(
+                            let env = env.hash_get(
                                 self.ctx,
                                 self.ctx.global(Global::ExportParent),
                                 Value::new_null(),
-                            )
+                            );
+                            if cell.symbolp() {
+                                if !cell.symbol_module().is_null() {
+                                    cell.symbol_module()
+                                } else {
+                                    env
+                                }
+                            } else {
+                                env
+                            }
                         } else {
-                            env
+                            if cell.symbolp() {
+                                if !cell.symbol_module().is_null() {
+                                    cell.symbol_module()
+                                } else {
+                                    env
+                                }
+                            } else {
+                                env
+                            }
                         },
                     };
                     return true;
@@ -1448,7 +1485,7 @@ impl Gc<Compiler> {
         };
 
         if !self.env_lookup(self.env, exp, &mut lookup, false) {
-            return self.syntax_error(format!("undefined variable '{}'", exp));
+            return self.syntax_error(format!("undefined variable '{}' in {}", exp, self.env));
         }
         self.generate_ref(&lookup, exp, exp);
         Value::new_null()
@@ -1758,8 +1795,8 @@ fn apply_macro(ctx: ContextRef, args: &[Value], closure: Value) -> CallResult {
     let macro_env = closure.vector_ref(0);
     let transformer = closure.vector_ref(1);
     let exp = args[0];
-
     let other_env = args[1];
+    //  println!("MACRO ENV {}\nUSE ENV {}", macro_env, other_env);
     let res = apply(ctx, transformer, &[exp, other_env, macro_env]);
 
     CallResult::Done(res)
@@ -1791,7 +1828,7 @@ pub fn type_error(ctx: ContextRef, in_: &str, pos: u32, expected: &str, found: V
     let message = make_string(
         ctx,
         format!(
-            "in procedure {}: Wrong type argument in position {} (expectiong {}): {}",
+            "in procedure {}: Wrong type argument in position {} (expecting {}): {}",
             in_, pos, expected, found
         ),
     );
@@ -1850,6 +1887,29 @@ pub(crate) fn init_primitives(ctx: ContextRef) {
         0,
         true,
     );*/
+
+    defun(
+        ctx,
+        "null?",
+        |_, args, _| CallResult::Done(Value::new_bool(args[0].is_null())),
+        1,
+        false,
+    );
+
+    defun(
+        ctx,
+        "eq?",
+        |_, args, _| CallResult::Done(Value::new_bool(args[0] == args[1])),
+        2,
+        false,
+    );
+    defun(
+        ctx,
+        "equal?",
+        |_, args, _| CallResult::Done(Value::new_bool(r5rs_equal_pred(args[0], args[1]))),
+        2,
+        false,
+    );
 
     defun(
         ctx,

@@ -1,5 +1,5 @@
 (module core)
-
+(import core parameter)
 (define (caar x) (car (car x)))
 (define (cadr x) (car (cdr x)))
 (define (cdar x) (cdr (car x)))
@@ -13,4 +13,5 @@
     cdar 
     cddr
     not
-    list)
+    list
+    make-parameter)
