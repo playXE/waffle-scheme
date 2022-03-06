@@ -1,39 +1,26 @@
-#![feature(arbitrary_self_types, vec_retain_mut, core_intrinsics)]
-use comet::api::{Collectable, Gc};
-use runtime::NanBoxedDecoder;
+#![feature(
+    const_type_id,
+    ptr_metadata,
+    core_intrinsics,
+    const_fn_fn_ptr_basics,
+    const_ptr_offset_from,
+    wrapping_int_impl,
+    try_trait_v2
+)]
 
-#[cfg(feature = "immix")]
-pub type Heap = comet::immix::Immix<NanBoxedDecoder>;
-#[cfg(feature = "minimark")]
-pub type Heap = comet::minimark::MiniMark;
-#[cfg(feature = "marksweep")]
-pub type Heap = comet::marksweep::MarkSweep;
-#[cfg(feature = "semispace")]
-pub type Heap = comet::semispace::SemiSpace;
+pub mod fnv;
+#[macro_use]
+pub mod gc;
 
-pub type Managed<T> = Gc<T, Heap>;
-pub type Weak<T> = comet::api::Weak<T, Heap>;
+pub mod disasm;
+pub mod gc_bdwgc;
+pub mod hash;
+pub mod sexp;
+pub mod vec;
+pub mod vm;
 
-#[macro_export]
-macro_rules! debug_unreachable {
-    () => {
-        debug_unreachable!("unreachable statement reached")
-    };
-    ($message: expr) => {{
-        #[cfg(debug_assertions)]
-        {
-            unreachable!($message);
-        }
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            core::hint::unreachable_unchecked()
-        }
-    }};
-}
+#[cfg(feature = "bdwgc")]
+pub use gc_bdwgc::Heap;
 
-pub mod bytecompiler;
-pub mod compiler;
-pub mod init;
-pub mod jit;
-pub mod runtime;
-pub mod tracing_jit;
+#[cfg(not(feature = "bdwgc"))]
+pub use gc::Heap;

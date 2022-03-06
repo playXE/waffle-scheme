@@ -1,23 +1,16 @@
 (module core)
-(import core primitives)
-(import core macros)
-(import core lists)
+
+(define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
+(define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+
+(define (not x) (if x #f #t))
+(define (list . args) args)
 (export 
-    map 
-    append 
+    caar 
     cadr 
     cdar 
-    caar 
-    cddr 
-    cadar 
-    caddr 
-    cdddr 
-    quasiquote 
-    let 
-    let* 
-    letrec
-    cond
-    while
-
-    assq
-)
+    cddr
+    not
+    list)
