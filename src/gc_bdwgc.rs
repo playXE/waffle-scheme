@@ -161,7 +161,7 @@ impl Heap {
 }
 
 #[allow(dead_code)]
-mod ffi {
+pub(crate) mod ffi {
     #[repr(C)]
     #[derive(Default, Debug)]
     pub struct ProfileStats {
@@ -242,5 +242,7 @@ mod ffi {
         pub(crate) fn GC_allow_register_threads();
 
         pub(crate) fn GC_init();
+
+        pub(crate) fn GC_dump();
     }
 }

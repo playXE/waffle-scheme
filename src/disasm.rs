@@ -46,7 +46,7 @@ pub fn disasm(ctx: ContextRef, x: Value) -> Value {
     out.push_str("upvalues: \n");
     for i in 0..proc.upvalues.bvector_length::<UpvalLoc>() {
         let l = proc.upvalues.bvector_ref::<UpvalLoc>(i);
-        out.push_str(&format!(" {:04}: ({}, {:04})", i, l.local, l.index));
+        out.push_str(&format!(" {:04}: ({}, {:04})\n", i, l.local, l.index));
     }
     out.push_str(&format!(
         "stack_size: {}\nlocals: {}\n",
@@ -106,23 +106,23 @@ pub fn disasm(ctx: ContextRef, x: Value) -> Value {
                 }
 
                 Op::GlobalRef => {
-                    let ix = ip.cast::<u16>().read();
-                    ip = ip.add(2);
+                    let ix = ip.cast::<Value>().read();
+                    ip = ip.add(8);
 
-                    out.push_str(&format!(
-                        "GLOBAL_REF {}\n",
-                        proc.constants.vector_ref(ix as _)
-                    ));
+                    out.push_str(&format!("GLOBAL_REF {}\n", ix.cdr()));
+                }
+                Op::GlobalRefKnown => {
+                    let ix = ip.cast::<Value>().read();
+                    ip = ip.add(8);
+
+                    out.push_str(&format!("GLOBAL_REF_KNOWN {}\n", ix));
                 }
 
                 Op::GlobalSet => {
-                    let ix = ip.cast::<u16>().read();
-                    ip = ip.add(2);
+                    let ix = ip.cast::<Value>().read();
+                    ip = ip.add(8);
 
-                    out.push_str(&format!(
-                        "GLOBAL_SET {}\n",
-                        proc.constants.vector_ref(ix as _)
-                    ));
+                    out.push_str(&format!("GLOBAL_SET {}\n", ix));
                 }
                 Op::Apply => {
                     let ix = ip.cast::<u16>().read();

@@ -9,10 +9,11 @@ use std::{
 
 use crate::{
     gc::{allocator::PageReleaseMode, Gc},
-    gc_bdwgc::DEFAULT_INITIAL_HEAP_SIZE,
     vec::GcVec,
     vm::{env_define, Compiler},
 };
+
+pub const DEFAULT_INITIAL_HEAP_SIZE: usize = 256 * 1024 * 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
@@ -257,6 +258,11 @@ impl Value {
             as_int64: Self::VALUE_NULL as _,
         })
     }
+    pub fn undefined() -> Self {
+        Self(EncodedValueDescriptor {
+            as_int64: Self::VALUE_UNDEFINED as _,
+        })
+    }
 
     pub fn empty() -> Self {
         Self(EncodedValueDescriptor {
@@ -361,6 +367,7 @@ pub struct Synclo {
     env: Value,
     vars: Value,
     expr: Value,
+    rename: Value,
 }
 
 #[repr(C)]
@@ -402,7 +409,10 @@ impl Value {
         self.as_cell().is_tagged(x)
     }
     pub fn macrop(self) -> bool {
-        self.check_tag(ValueType::Macro as _)
+        self.nativep()
+            && self
+                .downcast::<NativeProcedure>(ValueType::NativeFunction as _)
+                .macrop
     }
 
     pub fn synclop(self) -> bool {
@@ -520,6 +530,18 @@ impl Value {
 
     pub fn cdddr(self) -> Value {
         self.cddr().cdr()
+    }
+
+    pub fn cdar(self) -> Value {
+        self.car().cdr()
+    }
+
+    pub fn cddar(self) -> Value {
+        self.cdar().cdr()
+    }
+
+    pub fn cadar(self) -> Value {
+        self.cdar().car()
     }
 
     pub fn upvalue_value(self) -> Value {
@@ -674,21 +696,57 @@ impl Value {
     pub fn synclo_expr(self) -> Value {
         self.downcast::<Synclo>(ValueType::Synclo as _).expr
     }
+    pub fn synclo_rename(self) -> Value {
+        self.downcast::<Synclo>(ValueType::Synclo as _).rename
+    }
 
-    pub fn synclo_vars_set(self, x: Value) {
+    pub fn set_synclo_rename(self, x: Value) {
+        self.downcast::<Synclo>(ValueType::Synclo as _).rename = x;
+    }
+    pub fn set_synclo_vars(self, x: Value) {
         self.downcast::<Synclo>(ValueType::Synclo as _).vars = x;
     }
 
-    pub fn synclo_env_set(self, x: Value) {
+    pub fn set_synclo_env(self, x: Value) {
         self.downcast::<Synclo>(ValueType::Synclo as _).env = x;
     }
 
-    pub fn synclo_vars_expr(self, x: Value) {
+    pub fn set_synclo_expr(self, x: Value) {
         self.downcast::<Synclo>(ValueType::Synclo as _).expr = x;
     }
 
     pub fn macro_procedure_set(self, x: Value) {
         self.downcast::<Macro>(ValueType::Macro as _).procedure = x;
+    }
+
+    pub fn fixnump(self) -> bool {
+        self.is_int32()
+    }
+
+    pub fn flonump(self) -> bool {
+        self.is_double()
+    }
+
+    pub fn new(x: impl Into<Self>) -> Self {
+        x.into()
+    }
+}
+
+impl Into<Value> for f64 {
+    fn into(self) -> Value {
+        Value::new_f64(self)
+    }
+}
+
+impl Into<Value> for i32 {
+    fn into(self) -> Value {
+        Value::new_i32(self)
+    }
+}
+
+impl Into<Value> for bool {
+    fn into(self) -> Value {
+        Value::new_bool(self)
     }
 }
 
@@ -896,13 +954,13 @@ impl Default for ContextParams {
         Self {
             gc_verbose: 0,
             heap_growth_multiplier: 1.5,
-            heap_max_size: 128 * 1024 * 1024,
+            heap_max_size: 256 * 1024 * 1024,
             heap_min_size: 32 * 1024,
-            heap_size: DEFAULT_INITIAL_HEAP_SIZE,
-            heap_threshold: 128 * 1024,
+            heap_size: 256 * 1024 * 1024,
+            heap_threshold: DEFAULT_INITIAL_HEAP_SIZE,
             page_release_mode: PageReleaseMode::SizeAndEnd,
             page_release_threshold: 16 * 1024,
-            stack_size: 8 * 1024,
+            stack_size: 16 * 1024,
         }
     }
 }
@@ -1010,10 +1068,12 @@ impl ContextRef {
         let n2 = make_string(self, "#user");
         self.register_module(n2, self.user_module);
 
-        self.toplevel_cc = Some(Compiler::new(self, Value::new_null()));
+        self.toplevel_cc = Some(Compiler::new(self, None, Value::new_null()));
         self.toplevel_cc.unwrap().enter_module(n2);
 
         super::vm::init_primitives(self);
+        super::math::init_math(self);
+        super::vector::init_vector(self);
     }
 
     pub fn register_module(self, name: Value, env: Value) -> Value {
@@ -1055,12 +1115,14 @@ impl ContextRef {
             whole_path.push_str(&path);
 
             let whole_path = std::path::Path::new(&whole_path);
+
             if !whole_path.exists() {
                 continue;
             }
             let saved = self.toplevel_cc.unwrap();
-            self.toplevel_cc = Some(Compiler::new(self, Value::new_null()));
-            let res = self.load_file(&whole_path, x);
+            println!("load {}", whole_path.display());
+            self.toplevel_cc = Some(Compiler::new(self, None, Value::new_null()));
+            let res = self.load_file(&whole_path, x)?;
             self.toplevel_cc = Some(saved);
             if res.exceptionp() {
                 return res;
@@ -1104,10 +1166,29 @@ impl ContextRef {
             let name = self.user_module.hash_get(self, tag, Value::new_null());
             self.toplevel_cc.unwrap().enter_module(name)?;
         }
-        let parser = lexpr::Parser::from_str(&file);
-        let proc = self.toplevel_cc.unwrap().compile_code(parser)?;
+        let mut parser = lexpr::Parser::from_str(&file);
+        let mut acc = Value::new_null();
 
-        crate::vm::apply(self, proc, &[])
+        while let Some(expr) = parser.next() {
+            match expr {
+                Ok(expr) => {
+                    let expr = lexpr_to_sexp(self, &expr);
+
+                    let proc = self.toplevel_cc.unwrap().compile_sexp(expr)?;
+
+                    if !proc.is_null() {
+                        acc = crate::vm::apply(self, proc, &[])?;
+                    }
+                    self.toplevel_cc.unwrap().clear();
+                }
+                Err(e) => {
+                    panic!("{}", e);
+                }
+            }
+        }
+        //  let proc = self.toplevel_cc.unwrap().compile_code(parser)?;
+        //crate::vm::apply(self, proc, &[])
+        acc
     }
 }
 
@@ -1126,7 +1207,7 @@ pub fn intern(mut ctx: ContextRef, s: impl AsRef<str>) -> Value {
     let sym = ctx.heap().allocate_tagged(
         Symbol {
             name: sym,
-            value: Value::new_null(),
+            value: Value::undefined(),
             module: Value::new_null(),
         },
         ValueType::Symbol as _,
@@ -1231,7 +1312,12 @@ pub fn make_hash(ctx: ContextRef, size: usize) -> Value {
 
 pub fn make_synclo(mut ctx: ContextRef, env: Value, vars: Value, expr: Value) -> Value {
     Value::new_cell(ctx.heap().allocate_tagged(
-        Synclo { env, vars, expr },
+        Synclo {
+            env,
+            vars,
+            expr,
+            rename: Value::new_null(),
+        },
         ValueType::Synclo as _,
         false,
         false,
@@ -1275,6 +1361,7 @@ pub enum Op {
     ClosureRef,
     ClosureSet,
     GlobalRef,
+    GlobalRefKnown,
     GlobalSet,
     Pop,
     Dup,
@@ -1331,14 +1418,22 @@ pub struct Stack {
 impl Stack {
     pub(crate) fn new(ctx: &mut crate::Heap, size: usize) -> Gc<Self> {
         let size = size + size_of::<Self>();
-        let p = ctx.allocate(Stack {
-            top: 0,
-            current: null_mut(),
-            length: size,
-            data: [0; 1],
-        });
+        unsafe {
+            let p = ctx.allocate_var(
+                Stack {
+                    top: 0,
+                    current: null_mut(),
+                    length: size,
+                    data: [0; 1],
+                },
+                ValueType::Object as _,
+                false,
+                false,
+                size,
+            );
 
-        p
+            p
+        }
     }
 
     pub unsafe fn make_frame(
@@ -1387,6 +1482,7 @@ impl Stack {
                 (*(*f).upvalues.add(i as _)).upvalue_close();
             }
         }
+
         self.top = (*f).sp as _;
         self.current = (*f).prev;
     }
@@ -1570,12 +1666,12 @@ fn format(visited: &mut HashSet<Value>, val: Value, f: &mut fmt::Formatter<'_>) 
         }
         write!(f, ")")?;
     } else if val.synclop() {
-        write!(f, "#<SC")?;
+        write!(f, "#<SC ")?;
         format(visited, val.synclo_expr(), f)?;
         write!(f, " ")?;
         format(visited, val.synclo_vars(), f)?;
-        write!(f, " ")?;
-        format(visited, val.synclo_env(), f)?;
+        write!(f, ">")?;
+        //format(visited, val.synclo_env(), f)?;
     } else if val.symbolp() {
         write!(f, "{}", val.symbol_name().string_data())?;
     } else if val.stringp() {

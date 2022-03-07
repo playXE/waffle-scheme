@@ -188,6 +188,9 @@ impl Heap {
 
     unsafe fn mark_object(&mut self, object: *mut CellHeader, size: usize) {
         if !self.mark_bitmap.set_sync(object.cast()) {
+            if !self.live_bitmap.test(object.cast()) {
+                panic!("Not valid address: {:p}", object);
+            }
             self.deque.push((object.cast::<u8>(), size));
         }
     }
@@ -217,7 +220,15 @@ impl Heap {
             let mut pm_idx = self.allocator.to_page_map_index(pointer);
 
             let object = match self.allocator.page_map_kind_at(pm_idx) {
-                PageMapKind::LargeObject => pointer.cast::<CellHeader>(), // no need to check bitmap if it is large page
+                PageMapKind::LargeObject => {
+                    let p = self
+                        .allocator
+                        .base()
+                        .add(pm_idx * PAGE_SIZE)
+                        .cast::<CellHeader>();
+
+                    p
+                } // no need to check bitmap if it is large page
                 PageMapKind::LargeObjectPart => {
                     // if it is large object part we also don't have to check bitmap
                     while {
@@ -263,7 +274,14 @@ impl Heap {
             };
 
             let sz = (*object).size();
-
+            if sz > 2048 {
+                println!(
+                    "cell {:p} ({}) of {}",
+                    object,
+                    formatted_size(sz),
+                    (*object).tag
+                );
+            }
             self.mark_object(object, sz);
         }
     }
@@ -319,6 +337,12 @@ impl Heap {
             );
         }
         while let Some((start, size)) = self.deque.pop() {
+            assert!(
+                self.live_bitmap.test(start),
+                "address {:p} ({}b) is not valid",
+                start,
+                size
+            );
             let mut cursor = start.cast::<*mut u8>();
 
             let end = start.add(size);
@@ -514,7 +538,6 @@ impl Heap {
     }
 
     pub unsafe fn free(&mut self, pointer: *mut u8) {
-        return;
         let cell = pointer.sub(size_of::<CellHeader>());
         let sz = (*cell.cast::<CellHeader>()).size();
         self.allocator.free(cell);
@@ -522,6 +545,8 @@ impl Heap {
 
         self.allocated -= sz;
     }
+
+    pub fn print_stats(&mut self) {}
 }
 
 pub struct Gc<T: ?Sized> {

@@ -1,8 +1,6 @@
 (import core)
 
-
-
-(define x (make-parameter 42))
-(print (x))
-(x 45)
-(print (x))
+(let loop ((i 0))
+    (cond 
+        ((< i 100) (print i) (loop (+ i 1)))
+        (else i)))

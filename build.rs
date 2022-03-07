@@ -19,40 +19,42 @@ where
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let mut boehm_src = PathBuf::from(out_dir);
-    boehm_src.push(BOEHM_DIR);
+    if cfg!(feature = "bdwgc") {
+        println!("cargo:rerun-if-changed=build.rs");
+        let out_dir = env::var("OUT_DIR").unwrap();
+        let mut boehm_src = PathBuf::from(out_dir);
+        boehm_src.push(BOEHM_DIR);
 
-    //if !boehm_src.exists() {
-    run("git", |cmd| {
-        cmd.arg("clone").arg(BOEHM_REPO).arg(&boehm_src)
-    });
+        //if !boehm_src.exists() {
+        run("git", |cmd| {
+            cmd.arg("clone").arg(BOEHM_REPO).arg(&boehm_src)
+        });
 
-    run("git", |cmd| {
-        cmd.arg("clone")
-            .arg(BOEHM_ATOMICS_REPO)
-            .current_dir(&boehm_src)
-    });
+        run("git", |cmd| {
+            cmd.arg("clone")
+                .arg(BOEHM_ATOMICS_REPO)
+                .current_dir(&boehm_src)
+        });
 
-    env::set_current_dir(&boehm_src).unwrap();
+        env::set_current_dir(&boehm_src).unwrap();
 
-    run("./autogen.sh", |cmd| cmd);
-    run("./configure", |cmd| {
-        cmd.arg("--enable-static")
-            .arg("--disable-shared")
-            .env("CFLAGS", format!("{} -O2", "-fPIC",))
-    });
+        run("./autogen.sh", |cmd| cmd);
+        run("./configure", |cmd| {
+            cmd.arg("--enable-static")
+                .arg("--disable-shared")
+                .env("CFLAGS", format!("{} -O1 -g", "-fPIC",))
+        });
 
-    run("make", |cmd| cmd.arg("-j"));
-    //}
+        run("make", |cmd| cmd.arg("-j"));
+        //}
 
-    let mut libpath = PathBuf::from(&boehm_src);
-    libpath.push(BUILD_DIR);
+        let mut libpath = PathBuf::from(&boehm_src);
+        libpath.push(BUILD_DIR);
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        &libpath.as_path().to_str().unwrap()
-    );
-    println!("cargo:rustc-link-lib=static=gc");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            &libpath.as_path().to_str().unwrap()
+        );
+        println!("cargo:rustc-link-lib=static=gc");
+    }
 }

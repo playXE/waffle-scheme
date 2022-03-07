@@ -18,4 +18,4 @@ lexpr = "0.2"
 track-source = []
 green-threads = []
 bdwgc = []
-default = ["track-source", "bdwgc"]
+default = []

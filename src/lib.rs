@@ -13,11 +13,16 @@ pub mod fnv;
 pub mod gc;
 
 pub mod disasm;
+#[cfg(feature = "bdwgc")]
 pub mod gc_bdwgc;
 pub mod hash;
+pub mod math;
 pub mod sexp;
 pub mod vec;
+pub mod vector;
 pub mod vm;
+
+pub const STDLIB_DIR: &'static str = concat!(env!("CARGO_MANIFEST_DIR"), "/stdlib");
 
 #[cfg(feature = "bdwgc")]
 pub use gc_bdwgc::Heap;

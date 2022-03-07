@@ -674,8 +674,8 @@ impl GcAllocator {
             if run == self.current_runs[idx] {
                 self.current_runs[idx] = &mut DEDICATED_FULL_RUN;
             }
-
-            self.free_pages(run.cast());
+            (*run).zero_header_and_slot_headers();
+            self.free_pages(run.cast(), true);
         } else {
             // It is not completely free. If it wasn't the current run or
             // already in the non-full run set (i.e., it was full) insert it
@@ -696,7 +696,8 @@ impl GcAllocator {
 
         match self.page_map.add(pm_idx).cast::<PageMapKind>().read() {
             PageMapKind::LargeObject => {
-                return self.free_pages(ptr);
+                println!("free large {:p}", ptr);
+                return self.free_pages(ptr, false);
             }
             PageMapKind::LargeObjectPart => {
                 unreachable!("Unreachable: trying to free large object part at {:p}", ptr);
@@ -725,7 +726,7 @@ impl GcAllocator {
         }
     }
 
-    pub unsafe fn free_pages(&mut self, ptr: *mut u8) -> usize {
+    pub unsafe fn free_pages(&mut self, ptr: *mut u8, already_zero: bool) -> usize {
         let pm_idx = self.to_page_map_index(ptr);
         let pm_type = self.page_map.add(pm_idx).read();
         let pm_part_type;
@@ -748,7 +749,21 @@ impl GcAllocator {
         }
 
         let byte_size = num_pages * PAGE_SIZE;
-
+        if already_zero {
+            if cfg!(debug_assertions) {
+                let word_ptr = ptr.cast::<usize>();
+                for i in 0..byte_size / size_of::<usize>() {
+                    debug_assert_eq!(
+                        word_ptr.add(i).read(),
+                        0,
+                        "words don't match at index {}",
+                        i
+                    );
+                }
+            }
+        } else {
+            core::ptr::write_bytes(ptr, 0, byte_size);
+        }
         let mut fpr = ptr.cast::<FreeRun>();
 
         if cfg!(debug_assertions) {
@@ -859,7 +874,8 @@ impl GcAllocator {
                 run = self.base.add(pi * PAGE_SIZE).cast::<Run>();
             } else if page_map_entry == PageMapKind::LargeObject {
                 //   println!("large??");
-                freed_bytes += self.free_pages(ptr);
+
+                freed_bytes += self.free_pages(ptr, false);
 
                 continue;
             } else {
@@ -889,7 +905,7 @@ impl GcAllocator {
 
                 if !run_was_current {
                     (*run).zero_header_and_slot_headers();
-                    self.free_pages(run.cast());
+                    self.free_pages(run.cast(), true);
                 }
             } else {
                 if run == *self.current_runs.get_unchecked(idx) {
